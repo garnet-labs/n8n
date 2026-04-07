@@ -21,6 +21,7 @@ import { OperationalError, UserError } from 'n8n-workflow';
 import { Agent } from './entities/agent.entity';
 import { N8NCheckpointStorage } from './integrations/n8n-checkpoint-storage';
 import { AgentRepository } from './repositories/agent.repository';
+import { NodeToolRepository } from './tool-repository';
 import type { WorkflowToolDescriptor } from './types';
 
 import { ActiveExecutions } from '@/active-executions';
@@ -100,6 +101,7 @@ export class AgentsService {
 		private readonly n8nCheckpointStorage: N8NCheckpointStorage,
 		private readonly secureRuntime: AgentSecureRuntime,
 		private readonly ephemeralNodeExecutor: EphemeralNodeExecutor,
+		private readonly nodeToolRepository: NodeToolRepository,
 	) {}
 
 	async create(projectId: string, name: string): Promise<Agent> {
@@ -380,7 +382,12 @@ export class AgentsService {
 	 * Workflow and node tools are resolved earlier via `makeToolResolver()` inside
 	 * `fromSchema()`, so this method only handles host-side singletons.
 	 */
-	private async injectRuntimeDependencies(agent: agents.Agent, agentId: string): Promise<void> {
+	private async injectRuntimeDependencies(
+		agent: agents.Agent,
+		agentId: string,
+		projectId: string,
+		credentialProvider: CredentialProvider,
+	): Promise<void> {
 		// Inject the rich_interaction tool for ad-hoc UI in chat integrations.
 		try {
 			const { createRichInteractionTool } = await import('./integrations/rich-interaction-tool');
@@ -391,6 +398,40 @@ export class AgentsService {
 				error: toolError instanceof Error ? toolError.message : String(toolError),
 			});
 		}
+
+		// Self-schema tools: let the agent read and rewrite its own code, and discover node tools.
+		const { createGetMyCodeTool, createTypecheckTool, createSetCodeTool, createListToolsTool } =
+			await import('./integrations/self-schema-tools');
+
+		agent.tool(
+			createGetMyCodeTool(async () => {
+				const entity = await this.agentRepository.findByIdAndProjectId(agentId, projectId);
+				return entity?.code ?? '';
+			}),
+		);
+
+		agent.tool(
+			createTypecheckTool(async (code: string) => {
+				try {
+					await this.secureRuntime.describeSecurely(code);
+					return { ok: true, error: null };
+				} catch (e) {
+					return { ok: false, error: e instanceof Error ? e.message : String(e) };
+				}
+			}),
+		);
+
+		agent.tool(
+			createSetCodeTool(async (code: string) => {
+				await this.updateCode(agentId, projectId, code);
+			}),
+		);
+
+		agent.tool(
+			createListToolsTool(async () => {
+				return await this.nodeToolRepository.listTools(credentialProvider);
+			}),
+		);
 
 		// Inject checkpoint storage
 		if (!agent.hasCheckpointStorage()) {
@@ -427,7 +468,12 @@ export class AgentsService {
 			resolveTool: this.makeToolResolver(agentEntity.projectId, userId),
 		});
 
-		await this.injectRuntimeDependencies(reconstructed, agentEntity.id);
+		await this.injectRuntimeDependencies(
+			reconstructed,
+			agentEntity.id,
+			agentEntity.projectId,
+			credentialProvider,
+		);
 
 		return reconstructed;
 	}
@@ -565,7 +611,12 @@ export class AgentsService {
 					resolveTool: this.makeToolResolver(agentEntity.projectId, userId),
 				});
 
-				await this.injectRuntimeDependencies(reconstructed, agentEntity.id);
+				await this.injectRuntimeDependencies(
+					reconstructed,
+					agentEntity.id,
+					agentEntity.projectId,
+					credentialProvider,
+				);
 
 				return { ok: true, agent: reconstructed as BuiltAgent };
 			} catch (e) {
