@@ -38,7 +38,6 @@ export const LOG_SCOPES = [
 	'ssrf-protection',
 	'token-exchange',
 	'instance-version-history',
-	'instance-ai',
 	'instance-registry',
 ] as const;
 
