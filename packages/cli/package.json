@@ -160,7 +160,7 @@
     "express-prom-bundle": "8.0.0",
     "express-rate-limit": "7.5.0",
     "fast-glob": "catalog:",
-    "flat": "5.0.2",
+"flat": "5.0.2",
     "flatted": "catalog:",
     "formidable": "3.5.4",
     "handlebars": "4.7.9",
