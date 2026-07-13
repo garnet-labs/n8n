@@ -42,6 +42,12 @@ jobs:
       - name: Install local gateway
         run: pnpm --filter @n8n/local-gateway... install --frozen-lockfile
 
+      - name: Build browser MCP dependency
+        run: pnpm --filter @n8n/mcp-browser build > /tmp/mcp-browser-build.log 2>&1
+
+      - name: Build computer-use dependency
+        run: pnpm --filter @n8n/computer-use build > /tmp/computer-use-build.log 2>&1
+
       - name: Build local gateway
         run: pnpm --filter @n8n/local-gateway build > /tmp/local-gateway-build.log 2>&1
 
@@ -53,4 +59,11 @@ jobs:
 
       - name: Show build log on failure
         if: failure()
-        run: tail -200 /tmp/local-gateway-build.log
+        run: |
+          for log in /tmp/mcp-browser-build.log /tmp/computer-use-build.log /tmp/local-gateway-build.log; do
+            if [ -f "$log" ]; then
+              echo "::group::$log"
+              tail -200 "$log"
+              echo "::endgroup::"
+            fi
+          done
