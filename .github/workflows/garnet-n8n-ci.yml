@@ -41,8 +41,6 @@ jobs:
 
       - name: Install local gateway
         run: pnpm --filter @n8n/local-gateway... install --frozen-lockfile
-        env:
-          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
 
       - name: Build browser MCP dependency
         run: pnpm --filter @n8n/mcp-browser build > /tmp/mcp-browser-build.log 2>&1
