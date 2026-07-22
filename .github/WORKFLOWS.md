@@ -181,6 +181,7 @@ These only run if specific files changed:
 | `packages/@n8n/ai-workflow-builder.ee/evaluations/programmatic/python/**` | `test-evals-python.yml`  | any        |
 | `packages/@n8n/benchmark/**`                                           | `build-benchmark-image.yml` | master     |
 | `packages/cli/src/public-api/**/*.{css,yaml,yml}`                      | `util-sync-api-docs.yml`    | master     |
+| `packages/@n8n/local-gateway/**`, root pnpm manifests                  | `garnet-n8n-ci.yml`         | any        |
 
 ### On PR Review
 
@@ -211,6 +212,7 @@ These only run if specific files changed:
 |---------------------------|---------------------------------------------------------|
 | `util-claude-task.yml`    | Run Claude Code to complete a task and create a PR      |
 | `util-data-tooling.yml`   | SQLite/PostgreSQL export/import validation (manual)     |
+| `garnet-n8n-ci.yml`       | Review local-gateway dependency execution with Garnet   |
 
 #### Claude Task Runner (`util-claude-task.yml`)
 
