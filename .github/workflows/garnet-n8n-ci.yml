@@ -1,0 +1,69 @@
+name: Garnet n8n CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/garnet-n8n-ci.yml'
+      - 'packages/@n8n/local-gateway/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  dep-install:
+    name: Dependency Install (Garnet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+
+      - name: Setup Node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24.14.1
+
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: v2.14.0
+
+      - name: Install local gateway
+        run: pnpm --filter @n8n/local-gateway... install --frozen-lockfile
+
+      - name: Build browser MCP dependency
+        run: pnpm --filter @n8n/mcp-browser build > /tmp/mcp-browser-build.log 2>&1
+
+      - name: Build computer-use dependency
+        run: pnpm --filter @n8n/computer-use build > /tmp/computer-use-build.log 2>&1
+
+      - name: Build local gateway
+        run: pnpm --filter @n8n/local-gateway build > /tmp/local-gateway-build.log 2>&1
+
+      - name: Typecheck local gateway
+        run: pnpm --filter @n8n/local-gateway typecheck
+
+      - name: Test local gateway
+        run: pnpm --filter @n8n/local-gateway test:unit --runInBand
+
+      - name: Show build log on failure
+        if: failure()
+        run: |
+          for log in /tmp/mcp-browser-build.log /tmp/computer-use-build.log /tmp/local-gateway-build.log; do
+            if [ -f "$log" ]; then
+              echo "::group::$log"
+              tail -200 "$log"
+              echo "::endgroup::"
+            fi
+          done
