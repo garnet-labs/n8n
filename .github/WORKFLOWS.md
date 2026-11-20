@@ -661,6 +661,20 @@ cosign verify-attestation --type openvex \
 
 ---
 
+## Fork review policy
+
+- `garnet-record.yml` continues to record the frozen pnpm install using OIDC.
+- `pr-approval-agent.yml` runs StampHog from the default branch after recorder
+  completion, finalized App comments, or manual dispatch with `pr_number`.
+  It resolves the current PR head, uses API diffs and trusted master policy,
+  and uses the org `ANTHROPIC_API_KEY` secret. It never executes PR code.
+- `merge-gate.yml` relays Garnet's head-bound outcome as a PR comment. It runs
+  on recorder completion, Garnet App comments, or manual dispatch with
+  `pr_number`; it does not merge
+  or install a required branch-protection check.
+
+See `.stamphog/README.md` for scope and limitations.
+
 ## Future Vision
 
 ### Redundancy Review

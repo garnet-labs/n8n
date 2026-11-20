@@ -1,0 +1,56 @@
+name: Merge gate
+
+on:
+  workflow_run:
+    workflows: [Garnet Runtime Visibility]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to gate
+        required: true
+        type: string
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: merge-gate-${{ inputs.pr_number || github.event.issue.number || github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    if: >-
+      github.ref == 'refs/heads/master' && (
+        github.event_name != 'issue_comment' || (
+          github.event.issue.pull_request &&
+          github.event.comment.user.login == 'garnet-runtime-review[bot]'
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          persist-credentials: false
+          sparse-checkout: .github/merge-gate
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Resolve current PR and await finalized record
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/merge-gate/pr_context.py resolve
+      - name: Relay current-head record
+        if: steps.pr.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          STAMPHOG_EXPECTED_HEAD: ${{ steps.pr.outputs.head }}
+        run: python3 .github/merge-gate/gate.py "$GITHUB_REPOSITORY" "$PR_NUMBER"
