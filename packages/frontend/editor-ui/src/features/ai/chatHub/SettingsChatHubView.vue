@@ -1,0 +1,182 @@
+<script setup lang="ts">
+import { useDocumentTitle } from '@/app/composables/useDocumentTitle';
+import { useTelemetry } from '@n8n/composables/useTelemetry';
+import { useToast } from '@n8n/composables/useToast';
+import { useSettingsStore } from '@n8n/stores/settings.store';
+import { useUIStore } from '@/app/stores/ui.store';
+import { useCredentialsStore } from '@/features/credentials/credentials.store';
+import { usePostHog } from '@/app/stores/posthog.store';
+import { hasPermission } from '@/app/utils/rbac/permissions';
+import { CHAT_HUB_SEMANTIC_SEARCH_EXPERIMENT } from '@/app/constants';
+import {
+	type ChatHubLLMProvider,
+	type ChatProviderSettingsDto,
+	PROVIDER_CREDENTIAL_TYPE_MAP,
+} from '@n8n/api-types';
+import {
+	N8nEnterpriseReadinessBadge,
+	N8nHeading,
+	N8nPreviewBadge,
+	N8nSettingsEnableRow,
+	N8nSettingsRowGroup,
+} from '@n8n/design-system';
+import { useI18n } from '@n8n/i18n';
+import { computed, onMounted } from 'vue';
+import { useChatStore } from './chat.store';
+import ChatProvidersTable from './components/ChatProvidersTable.vue';
+import { CHAT_PROVIDER_SETTINGS_MODAL_KEY } from './constants';
+import ChatSemanticSearchSettings from './ChatSemanticSearchSettings.vue';
+
+const i18n = useI18n();
+const posthogStore = usePostHog();
+const isSemanticSearchEnabled = computed(() =>
+	posthogStore.isVariantEnabled(
+		CHAT_HUB_SEMANTIC_SEARCH_EXPERIMENT.name,
+		CHAT_HUB_SEMANTIC_SEARCH_EXPERIMENT.variant,
+	),
+);
+const toast = useToast();
+const documentTitle = useDocumentTitle();
+
+const chatStore = useChatStore();
+const settingsStore = useSettingsStore();
+const credentialsStore = useCredentialsStore();
+const uiStore = useUIStore();
+const telemetry = useTelemetry();
+
+const disabled = computed(() => !hasPermission(['rbac'], { rbac: { scope: 'chatHub:manage' } }));
+
+const isChatEnabled = computed(() => settingsStore.moduleSettings['chat-hub']?.enabled === true);
+
+async function onToggleEnabled(enabled: boolean) {
+	try {
+		await chatStore.setChatEnabled(enabled);
+		toast.showMessage({
+			title: i18n.baseText('settings.chatHub.toggled.success'),
+			type: 'success',
+		});
+		if (enabled) {
+			await loadProviderSettings();
+		}
+	} catch (error) {
+		toast.showError(error, i18n.baseText('settings.chatHub.toggled.error'));
+	}
+}
+
+async function loadProviderSettings() {
+	await Promise.all([
+		fetchSettings(),
+		credentialsStore.fetchAllCredentials(),
+		credentialsStore.fetchCredentialTypes(false),
+	]);
+}
+
+const fetchSettings = async () => {
+	try {
+		await chatStore.fetchAllChatSettings();
+	} catch (error) {
+		toast.showError(error, i18n.baseText('settings.chatHub.providers.fetching.error'));
+	}
+};
+
+function onEditProvider(settings: ChatProviderSettingsDto) {
+	uiStore.openModalWithData({
+		name: CHAT_PROVIDER_SETTINGS_MODAL_KEY,
+		data: {
+			provider: settings.provider,
+			disabled: disabled.value,
+			onNewCredential: (provider: ChatHubLLMProvider) => {
+				const credentialType = PROVIDER_CREDENTIAL_TYPE_MAP[provider];
+
+				telemetry.track('User opened Credential modal', {
+					credential_type: credentialType,
+					source: 'chat_hub_settings',
+					new_credential: true,
+					workflow_id: null,
+				});
+
+				uiStore.openNewCredential(credentialType);
+			},
+			onConfirm: async (updatedSettings: ChatProviderSettingsDto) => {
+				try {
+					await chatStore.updateProviderSettings(updatedSettings);
+					toast.showMessage({
+						title: i18n.baseText('settings.chatHub.providers.updated.success'),
+						type: 'success',
+					});
+					await settingsStore.getModuleSettings();
+				} catch (error) {
+					toast.showError(error, i18n.baseText('settings.chatHub.providers.updated.error'));
+				}
+			},
+			onCancel: () => {},
+		},
+	});
+}
+
+async function onRefreshWorkflows() {
+	await fetchSettings();
+}
+
+onMounted(async () => {
+	documentTitle.set(i18n.baseText('settings.chatHub'));
+	if (!settingsStore.isChatFeatureEnabled) {
+		return;
+	}
+	await loadProviderSettings();
+});
+</script>
+<template>
+	<div :class="$style.container">
+		<div :class="$style.titleWithTag">
+			<N8nHeading size="2xlarge">
+				{{ i18n.baseText('settings.chatHub') }}
+			</N8nHeading>
+			<N8nPreviewBadge size="xsmall" data-test-id="chat-hub-preview-badge" />
+			<N8nEnterpriseReadinessBadge
+				v-if="settingsStore.isEnterprisePlan"
+				size="xsmall"
+				data-test-id="chat-hub-enterprise-readiness-badge"
+			/>
+		</div>
+
+		<N8nSettingsRowGroup>
+			<N8nSettingsEnableRow
+				data-test-id="chat-hub-enabled-row"
+				:title="i18n.baseText('settings.chatHub.enabled.label')"
+				:description="i18n.baseText('settings.chatHub.enabled.description')"
+				:enabled="isChatEnabled"
+				:disabled="disabled"
+				switch-test-id="chat-hub-enabled-switch"
+				@update:enabled="onToggleEnabled"
+			/>
+		</N8nSettingsRowGroup>
+
+		<template v-if="settingsStore.isChatFeatureEnabled">
+			<ChatProvidersTable
+				data-test-id="chat-providers-table"
+				:settings="chatStore.settings"
+				:loading="chatStore.settingsLoading"
+				:disabled="disabled"
+				@edit-provider="onEditProvider"
+				@refresh="onRefreshWorkflows"
+			/>
+			<ChatSemanticSearchSettings v-if="isSemanticSearchEnabled" />
+		</template>
+	</div>
+</template>
+
+<style lang="scss" module>
+.container {
+	display: flex;
+	flex-direction: column;
+	gap: var(--spacing--2xl);
+	padding-bottom: var(--spacing--2xl);
+}
+
+.titleWithTag {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--spacing--2xs);
+}
+</style>
