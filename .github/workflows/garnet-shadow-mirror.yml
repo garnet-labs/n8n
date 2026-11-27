@@ -15,6 +15,11 @@ on:
         description: List eligible changes without writing to GitHub
         type: boolean
         default: false
+      lookback_days:
+        description: Days of merged dependency changes to replay
+        required: false
+        default: '10'
+        type: string
 
 permissions:
   contents: read
@@ -45,13 +50,15 @@ jobs:
           GH_TOKEN: ${{ inputs.dry_run && github.token || '' }}
           PRS: ${{ inputs.prs }}
           DRY_RUN: ${{ inputs.dry_run }}
+          LOOKBACK_DAYS: ${{ inputs.lookback_days || '10' }}
         run: |
           set -euo pipefail
           if [[ "$DRY_RUN" != true && -z "$SHADOW_MIRROR_TOKEN" ]]; then
             echo '::error::Set SHADOW_MIRROR_TOKEN to a PAT with write access to Contents, Pull requests, Actions, and Workflows.'
             exit 1
           fi
-          args=()
+          [[ "$LOOKBACK_DAYS" =~ ^[0-9]+$ ]] || { echo 'Invalid lookback'; exit 1; }
+          args=(--lookback-days "$LOOKBACK_DAYS")
           if [[ "$DRY_RUN" == true ]]; then
             args+=(--dry-run)
           fi

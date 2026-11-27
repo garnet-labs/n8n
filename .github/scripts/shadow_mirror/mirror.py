@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import datetime
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import urllib.request
 FORK = "garnet-labs/n8n"
 SOURCE = "n8n-io/n8n"
 DEFAULT_BRANCH = "master"
+LOOKBACK_DAYS = 10
 WORKFLOW = "garnet-record.yml"
 MARKER = re.compile(
     r"<!-- garnet-shadow-mirror upstream=(\d+) upstream_head=([a-f0-9]{40}) "
@@ -38,11 +40,11 @@ CI_SKIP = re.compile(
     r"\[(skip ci|ci skip|no ci|skip actions|actions skip)\]", re.IGNORECASE
 )
 DISCOVERY = """
-query ($cursor: String) {
-  repository(owner: "n8n-io", name: "n8n") {
-    pullRequests(states: OPEN, first: 50, after: $cursor) {
-      pageInfo { hasNextPage endCursor }
-      nodes {
+query ($search: String!, $cursor: String) {
+  search(query: $search, type: ISSUE, first: 50, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest {
         number
         author { login }
         files(first: 20) { nodes { path } }
@@ -100,27 +102,44 @@ class API:
     def write(self, path, data, method="POST"):
         return self.call(FORK, path, method, data)
 
-    def dependency_candidates(self):
-        cursor = None
-        while True:
-            result = self._request(
-                "graphql", "POST", {"query": DISCOVERY, "variables": {"cursor": cursor}}
-            )
-            if result.get("errors"):
-                raise RuntimeError(f'GitHub discovery: {result["errors"]}')
-            prs = result["data"]["repository"]["pullRequests"]
-            for pr in prs["nodes"]:
-                author = (pr["author"] or {}).get("login", "").lower()
-                preview = (pr["files"] or {}).get("nodes", [])
-                if author in DEPENDENCY_BOTS or (
-                    author in LOCKFILE_BOTS
-                    and any(lockfile(file["path"]) for file in preview)
-                ):
-                    yield pr["number"]
-            page = prs["pageInfo"]
-            if not page["hasNextPage"]:
-                return
-            cursor = page["endCursor"]
+    def dependency_candidates(self, now=None):
+        since = (now or datetime.datetime.now(datetime.timezone.utc)) - datetime.timedelta(
+            days=LOOKBACK_DAYS
+        )
+        dep_slugs = {login.removesuffix("[bot]") for login in DEPENDENCY_BOTS}
+        lock_slugs = {login.removesuffix("[bot]") for login in LOCKFILE_BOTS}
+        for scope in ("is:open", f"is:merged merged:>={since:%Y-%m-%dT%H:%M:%SZ}"):
+            for login in sorted(ALL_BOTS):
+                slug = login.removesuffix("[bot]")
+                cursor = None
+                while True:
+                    search = f"repo:{SOURCE} is:pr {scope} author:app/{slug}"
+                    result = self._request(
+                        "graphql",
+                        "POST",
+                        {"query": DISCOVERY, "variables": {"search": search, "cursor": cursor}},
+                    )
+                    if result.get("errors"):
+                        raise RuntimeError(f'GitHub discovery: {result["errors"]}')
+                    page = result["data"]["search"]
+                    for pr in page["nodes"]:
+                        if not pr:
+                            continue
+                        author = (
+                            (pr.get("author") or {})
+                            .get("login", "")
+                            .lower()
+                            .removesuffix("[bot]")
+                        )
+                        preview = (pr.get("files") or {}).get("nodes", [])
+                        if author in dep_slugs or (
+                            author in lock_slugs
+                            and any(lockfile(file["path"]) for file in preview)
+                        ):
+                            yield pr["number"]
+                    if not page["pageInfo"]["hasNextPage"]:
+                        break
+                    cursor = page["pageInfo"]["endCursor"]
 
 
 def dependency_file(path):
@@ -144,6 +163,23 @@ def is_dependency_pr(pr, files):
     return any(
         matcher(file["filename"]) or matcher(file.get("previous_filename", ""))
         for file in files
+    )
+
+
+def within_lookback(timestamp, now=None):
+    if not timestamp:
+        return False
+    moment = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return now - moment <= datetime.timedelta(days=LOOKBACK_DAYS)
+
+
+def recently_merged(pr, now=None, history=None):
+    if not pr.get("merged_at"):
+        return False
+    return within_lookback(pr["merged_at"], now) or any(
+        mirror["state"] == "open" and within_lookback(mirror.get("created_at"), now)
+        for mirror in (history or {}).values()
     )
 
 
@@ -215,14 +251,15 @@ class Mirror:
         path = f"pulls/{number}"
         try:
             pr = api.call(SOURCE, path)
-            if pr["state"] == "open":
+            live = pr["state"] == "open" or recently_merged(pr, history=history)
+            if live:
                 files = list(api.pages(SOURCE, f"{path}/files"))
                 current = api.call(SOURCE, path)
         except APIError as error:
             if error.status != 404:
                 raise
             return {"status": "skipped", "reason": "upstream PR not found"}
-        if pr["state"] != "open":
+        if not live:
             return self.close(history, "source closed")
         if any(current[key] != pr[key] for key in ("state", "changed_files")) or any(
             current[key]["sha"] != pr[key]["sha"] for key in ("base", "head")
@@ -417,11 +454,14 @@ class Mirror:
 
 
 def main():
+    global LOOKBACK_DAYS
     parser = argparse.ArgumentParser()
     sync = parser.add_subparsers(dest="command", required=True).add_parser("sync")
     sync.add_argument("--pr", type=int, action="append")
     sync.add_argument("--dry-run", action="store_true")
+    sync.add_argument("--lookback-days", type=int, default=LOOKBACK_DAYS)
     args = parser.parse_args()
+    LOOKBACK_DAYS = args.lookback_days
     token = os.environ.get("SHADOW_MIRROR_TOKEN") or os.environ.get("GH_TOKEN")
     if not token:
         parser.error("Set SHADOW_MIRROR_TOKEN or GH_TOKEN")
