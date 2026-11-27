@@ -1,0 +1,12 @@
+{
+    "type": "object",
+    "properties": {
+        "_id": {
+            "type": "string"
+        },
+        "agencia": {
+            "type": "string"
+        }
+    },
+    "version": 3
+}

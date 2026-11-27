@@ -1,0 +1,50 @@
+{
+    "type": "object",
+    "properties": {
+        "contentType": {
+            "type": "string"
+        },
+        "id": {
+            "type": "string"
+        },
+        "isInline": {
+            "type": "boolean"
+        },
+        "lastModifiedDateTime": {
+            "type": "string"
+        },
+        "name": {
+            "type": "string"
+        },
+        "size": {
+            "type": "integer"
+        },
+        "value": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "contentType": {
+                        "type": "string"
+                    },
+                    "id": {
+                        "type": "string"
+                    },
+                    "isInline": {
+                        "type": "boolean"
+                    },
+                    "lastModifiedDateTime": {
+                        "type": "string"
+                    },
+                    "name": {
+                        "type": "string"
+                    },
+                    "size": {
+                        "type": "integer"
+                    }
+                }
+            }
+        }
+    },
+    "version": 10
+}
