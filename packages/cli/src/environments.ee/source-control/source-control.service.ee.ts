@@ -1,0 +1,577 @@
+import type {
+	PullWorkFolderRequestDto,
+	PushWorkFolderRequestDto,
+	SourceControlledFile,
+} from '@n8n/api-types';
+import { Logger } from '@n8n/backend-common';
+import { type User } from '@n8n/db';
+import { OnPubSubEvent } from '@n8n/decorators';
+import { Service } from '@n8n/di';
+import { hasGlobalScope } from '@n8n/permissions';
+import { writeFileSync } from 'fs';
+import { UnexpectedError, UserError, jsonParse } from 'n8n-workflow';
+import * as path from 'path';
+import type { PushResult } from 'simple-git';
+
+import {
+	SOURCE_CONTROL_ADMIN_PUSH_REQUIRED_MESSAGE,
+	SOURCE_CONTROL_DEFAULT_EMAIL,
+	SOURCE_CONTROL_DEFAULT_NAME,
+	SOURCE_CONTROL_README,
+	SOURCE_CONTROL_WORKFLOW_EXPORT_FOLDER,
+} from './constants';
+import { SourceControlExportService } from './source-control-export.service.ee';
+import { SourceControlGitService } from './source-control-git.service.ee';
+import {
+	getTagsPath,
+	getTrackingInformationFromPostPushResult,
+	getTrackingInformationFromPullResult,
+	normalizeAndValidateSourceControlledFilePath,
+	sourceControlFoldersExistCheck,
+} from './source-control-helper.ee';
+import { SourceControlImportService } from './source-control-import.service.ee';
+import { SourceControlPreferencesService } from './source-control-preferences.service.ee';
+import {
+	filterByType,
+	getDeletedResources,
+	getNonDeletedResources,
+} from './source-control-resource-helper';
+import { SourceControlScopedService } from './source-control-scoped.service';
+import { SourceControlStatusService } from './source-control-status.service.ee';
+import type { ImportResult } from './types/import-result';
+import { SourceControlContext } from './types/source-control-context';
+import type { SourceControlGetStatus } from './types/source-control-get-status';
+import type { SourceControlPreferences } from './types/source-control-preferences';
+
+import { BadRequestError } from '@/errors/response-errors/bad-request.error';
+import { ForbiddenError } from '@/errors/response-errors/forbidden.error';
+import { EventService } from '@/events/event.service';
+import { IWorkflowToImport } from '@/interfaces';
+
+@Service()
+export class SourceControlService {
+	/** Path to SSH private key in filesystem. */
+	private sshKeyName: string;
+
+	private sshFolder: string;
+
+	private gitFolder: string;
+
+	/** Flag to prevent concurrent configuration reloads */
+	private isReloading = false;
+
+	constructor(
+		private readonly logger: Logger,
+		private gitService: SourceControlGitService,
+		private sourceControlPreferencesService: SourceControlPreferencesService,
+		private sourceControlExportService: SourceControlExportService,
+		private sourceControlImportService: SourceControlImportService,
+		private sourceControlScopedService: SourceControlScopedService,
+		private readonly eventService: EventService,
+		private readonly sourceControlStatusService: SourceControlStatusService,
+	) {
+		const { gitFolder, sshFolder, sshKeyName } = sourceControlPreferencesService;
+		this.gitFolder = gitFolder;
+		this.sshFolder = sshFolder;
+		this.sshKeyName = sshKeyName;
+	}
+
+	async init(): Promise<void> {
+		await this.refreshServiceState();
+	}
+
+	private async refreshServiceState(): Promise<void> {
+		this.gitService.resetService();
+		sourceControlFoldersExistCheck([this.gitFolder, this.sshFolder]);
+		await this.sourceControlPreferencesService.loadFromDbAndApplySourceControlPreferences();
+		if (this.sourceControlPreferencesService.isSourceControlLicensedAndEnabled()) {
+			await this.initGitService();
+		}
+	}
+
+	/**
+	 * Ensures all main instances stay in sync with source control config changes made elsewhere in a multi-main setup.
+	 */
+	@OnPubSubEvent('reload-source-control-config', { instanceType: 'main' })
+	async reloadConfiguration(): Promise<void> {
+		if (this.isReloading) {
+			this.logger.warn('Source control configuration reload already in progress');
+			return;
+		}
+
+		this.isReloading = true;
+		try {
+			this.logger.debug('Source control configuration changed, reloading from database');
+
+			const wasConnected = this.sourceControlPreferencesService.isSourceControlConnected();
+			await this.refreshServiceState();
+			const isNowConnected = this.sourceControlPreferencesService.isSourceControlConnected();
+
+			if (wasConnected && !isNowConnected) {
+				await this.sourceControlExportService.deleteRepositoryFolder();
+				this.logger.info('Cleaned up git repository folder after source control disconnect');
+			}
+		} finally {
+			this.isReloading = false;
+		}
+	}
+
+	private async initGitService(): Promise<void> {
+		await this.gitService.initService({
+			sourceControlPreferences: this.sourceControlPreferencesService.getPreferences(),
+			gitFolder: this.gitFolder,
+			sshKeyName: this.sshKeyName,
+			sshFolder: this.sshFolder,
+		});
+	}
+
+	async sanityCheck(): Promise<void> {
+		try {
+			const foldersExisted = sourceControlFoldersExistCheck(
+				[this.gitFolder, this.sshFolder],
+				false,
+			);
+
+			if (!foldersExisted) {
+				throw new UserError('No folders exist');
+			}
+
+			if (!this.gitService.git) {
+				await this.initGitService();
+			}
+
+			const branches = await this.gitService.getCurrentBranch();
+			if (
+				branches.current === '' ||
+				branches.current !==
+					this.sourceControlPreferencesService.sourceControlPreferences.branchName
+			) {
+				throw new UserError('Branch is not set up correctly');
+			}
+		} catch (error) {
+			throw new BadRequestError(
+				'Source control is not properly set up, please disconnect and reconnect.',
+			);
+		}
+	}
+
+	async disconnect(options: { keepKeyPair?: boolean } = {}) {
+		try {
+			const preferences = this.sourceControlPreferencesService.getPreferences();
+
+			await this.sourceControlPreferencesService.setPreferences({
+				connected: false,
+				branchName: '',
+				repositoryUrl: '',
+				connectionType: preferences.connectionType,
+			});
+			await this.sourceControlExportService.deleteRepositoryFolder();
+
+			if (preferences.connectionType === 'https') {
+				await this.sourceControlPreferencesService.deleteHttpsCredentials();
+			} else if (!options.keepKeyPair) {
+				await this.sourceControlPreferencesService.deleteKeyPair();
+			}
+
+			this.gitService.resetService();
+
+			return this.sourceControlPreferencesService.sourceControlPreferences;
+		} catch (error) {
+			throw new UnexpectedError('Failed to disconnect from source control', { cause: error });
+		}
+	}
+
+	async initializeRepository(preferences: SourceControlPreferences, user: User) {
+		if (!this.gitService.git) {
+			await this.initGitService();
+		}
+		this.logger.debug('Initializing repository...');
+		await this.gitService.initRepository(preferences, user);
+		let getBranchesResult;
+		try {
+			getBranchesResult = await this.getBranches();
+		} catch (error) {
+			if ((error as Error).message.includes('Warning: Permanently added')) {
+				this.logger.debug('Added repository host to the list of known hosts. Retrying...');
+				getBranchesResult = await this.getBranches();
+			} else {
+				throw error;
+			}
+		}
+		if (getBranchesResult.branches.includes(preferences.branchName)) {
+			await this.gitService.setBranch(preferences.branchName);
+		} else {
+			if (getBranchesResult.branches?.length === 0) {
+				try {
+					writeFileSync(path.join(this.gitFolder, '/README.md'), SOURCE_CONTROL_README);
+
+					await this.gitService.stage(new Set<string>(['README.md']));
+					await this.gitService.commit('Initial commit');
+					await this.gitService.push({
+						branch: preferences.branchName,
+						force: true,
+					});
+					getBranchesResult = await this.getBranches();
+					await this.gitService.setBranch(preferences.branchName);
+				} catch (fileError) {
+					this.logger.error(`Failed to create initial commit: ${(fileError as Error).message}`);
+				}
+			}
+		}
+		await this.sourceControlPreferencesService.setPreferences({
+			branchName: getBranchesResult.currentBranch,
+			connected: true,
+		});
+		return getBranchesResult;
+	}
+
+	async getBranches(): Promise<{ branches: string[]; currentBranch: string }> {
+		// fetch first to get include remote changes
+		if (!this.gitService.git) {
+			await this.initGitService();
+		}
+		await this.gitService.fetch();
+		return await this.gitService.getBranches();
+	}
+
+	async setBranch(branch: string): Promise<{ branches: string[]; currentBranch: string }> {
+		if (!this.gitService.git) {
+			await this.initGitService();
+		}
+		await this.sourceControlPreferencesService.setPreferences({
+			branchName: branch,
+			connected: branch?.length > 0,
+		});
+		return await this.gitService.setBranch(branch);
+	}
+
+	/**
+	 * Resets the current local branch to match its remote counterpart, discarding all local changes.
+	 * This operation overwrites any uncommitted or divergent local changes with the state from the remote branch.
+	 * Use with caution, as this action cannot be undone.
+	 */
+	async resetWorkfolder(): Promise<ImportResult | undefined> {
+		if (!this.gitService.git) {
+			await this.initGitService();
+		}
+		try {
+			await this.gitService.resetBranch();
+			await this.gitService.pull();
+		} catch (error) {
+			this.logger.error(`Failed to reset workfolder: ${(error as Error).message}`);
+			throw new UserError(
+				'Unable to fetch updates from git - your folder might be out of sync. Try reconnecting from the Source Control settings page.',
+			);
+		}
+		return;
+	}
+
+	/**
+	 * Resolves which resources a push may act on. The status service is the single source of
+	 * truth for what the user may push: it scopes resources to the user's projects and derives
+	 * each resource's file path and status on the server. The client only selects resources by
+	 * (id, type); file path and status are always taken from the matching authorized entry, so
+	 * an authorized (id, type) cannot be pointed at another resource's file.
+	 */
+	private async resolveAuthorizedFilesToPush(
+		user: User,
+		requestedFiles: SourceControlledFile[],
+	): Promise<SourceControlledFile[]> {
+		const allowedResources = (await this.sourceControlStatusService.getStatus(user, {
+			direction: 'push',
+			verbose: false,
+			preferLocalVersion: true,
+		})) as SourceControlledFile[];
+
+		// No explicit selection: push everything the user is allowed to.
+		let filesToPush = allowedResources;
+
+		if (requestedFiles.length) {
+			const allowedKeys = new Set(
+				allowedResources.map((allowed) => `${allowed.type}:${allowed.id}`),
+			);
+			const requestedKeys = new Set<string>();
+			for (const requested of requestedFiles) {
+				const key = `${requested.type}:${requested.id}`;
+				if (!allowedKeys.has(key)) {
+					throw new ForbiddenError('You are not allowed to push these changes');
+				}
+				requestedKeys.add(key);
+			}
+			// Filter (don't map to one record per key) so a server-reported conflict for a
+			// (type, id) isn't dropped before the caller's conflict check.
+			filesToPush = allowedResources.filter((allowed) =>
+				requestedKeys.has(`${allowed.type}:${allowed.id}`),
+			);
+		}
+
+		// Defense in depth: keep every acted-on path inside the git work folder.
+		return filesToPush.map((file) => ({
+			...file,
+			file: normalizeAndValidateSourceControlledFilePath(this.gitFolder, file.file),
+		}));
+	}
+
+	async pushWorkfolder(
+		user: User,
+		options: PushWorkFolderRequestDto,
+	): Promise<{
+		statusCode: number;
+		pushResult: PushResult | undefined;
+		statusResult: SourceControlledFile[];
+	}> {
+		await this.sanityCheck();
+
+		if (this.sourceControlPreferencesService.isBranchReadOnly()) {
+			throw new BadRequestError('Cannot push onto read-only branch.');
+		}
+
+		await this.ensureCanPushWorkfolder(user);
+
+		const context = new SourceControlContext(user);
+
+		const filesToPush = await this.resolveAuthorizedFilesToPush(user, options.fileNames);
+
+		let statusResult: SourceControlledFile[] = filesToPush;
+
+		if (!options.force) {
+			const possibleConflicts = filesToPush?.filter((file) => file.conflict);
+			if (possibleConflicts?.length > 0) {
+				return {
+					statusCode: 409,
+					pushResult: undefined,
+					statusResult: filesToPush,
+				};
+			}
+		}
+
+		const filesToBePushed = new Set<string>();
+		const filesToBeDeleted = new Set<string>();
+
+		/*
+			Exclude tags, variables and folders JSON file from being deleted as
+			we keep track of them in a single file unlike workflows and credentials
+		*/
+		filesToPush
+			.filter((f) => ['workflow', 'credential', 'project'].includes(f.type))
+			.forEach((e) => {
+				if (e.status !== 'deleted') {
+					filesToBePushed.add(e.file);
+				} else {
+					filesToBeDeleted.add(e.file);
+				}
+			});
+
+		this.sourceControlExportService.rmFilesFromExportFolder(filesToBeDeleted);
+
+		const workflowsToBeExported = getNonDeletedResources(filesToPush, 'workflow');
+		await this.sourceControlExportService.exportWorkflowsToWorkFolder(workflowsToBeExported);
+
+		const credentialsToBeExported = getNonDeletedResources(filesToPush, 'credential');
+		const credentialExportResult =
+			await this.sourceControlExportService.exportCredentialsToWorkFolder(credentialsToBeExported);
+		if (credentialExportResult.missingIds && credentialExportResult.missingIds.length > 0) {
+			credentialExportResult.missingIds.forEach((id) => {
+				filesToBePushed.delete(this.sourceControlExportService.getCredentialsPath(id));
+				statusResult = statusResult.filter(
+					(e) => e.file !== this.sourceControlExportService.getCredentialsPath(id),
+				);
+			});
+		}
+
+		const projectsToBeExported = getNonDeletedResources(filesToPush, 'project');
+		await this.sourceControlExportService.exportTeamProjectsToWorkFolder(projectsToBeExported);
+
+		// The tags file is always re-generated and exported to make sure the workflow-tag mappings are up to date
+		filesToBePushed.add(getTagsPath(this.gitFolder));
+		await this.sourceControlExportService.exportTagsToWorkFolder(context);
+
+		const folderChanges = filterByType(filesToPush, 'folders')[0];
+		if (folderChanges) {
+			filesToBePushed.add(folderChanges.file);
+			await this.sourceControlExportService.exportFoldersToWorkFolder(context);
+		}
+
+		const variablesChanges = filterByType(filesToPush, 'variables')[0];
+		if (variablesChanges) {
+			filesToBePushed.add(variablesChanges.file);
+			await this.sourceControlExportService.exportGlobalVariablesToWorkFolder();
+		}
+
+		await this.gitService.stage(filesToBePushed, filesToBeDeleted);
+
+		// Set all results as pushed
+		statusResult.forEach((result) => (result.pushed = true));
+
+		await this.gitService.commit(options.commitMessage ?? 'Updated Workfolder');
+
+		const pushResult = await this.gitService.push({
+			branch: this.sourceControlPreferencesService.getBranchName(),
+			force: options.force ?? false,
+		});
+
+		// #region Tracking Information
+		this.eventService.emit(
+			'source-control-user-finished-push-ui',
+			getTrackingInformationFromPostPushResult(user.id, statusResult),
+		);
+		// #endregion
+
+		return {
+			statusCode: 200,
+			pushResult,
+			statusResult,
+		};
+	}
+
+	async pullWorkfolder(
+		user: User,
+		options: PullWorkFolderRequestDto,
+	): Promise<{ statusCode: number; statusResult: SourceControlledFile[] }> {
+		await this.sanityCheck();
+
+		const statusResult = (await this.sourceControlStatusService.getStatus(user, {
+			direction: 'pull',
+			verbose: false,
+			preferLocalVersion: false,
+		})) as SourceControlledFile[];
+
+		if (options.force !== true) {
+			const possibleConflicts = statusResult.filter(
+				(file) => file.conflict || file.status === 'modified',
+			);
+
+			if (possibleConflicts?.length > 0) {
+				await this.gitService.resetBranch();
+				return {
+					statusCode: 409,
+					statusResult,
+				};
+			}
+		}
+
+		// IMPORTANT: Make sure the projects and folders get processed first as the workflows depend on them
+		const projectsToBeImported = getNonDeletedResources(statusResult, 'project');
+		await this.sourceControlImportService.importTeamProjectsFromWorkFolder(projectsToBeImported);
+
+		const foldersToBeImported = getNonDeletedResources(statusResult, 'folders')[0];
+		if (foldersToBeImported) {
+			await this.sourceControlImportService.importFoldersFromWorkFolder(user, foldersToBeImported);
+		}
+
+		const workflowsToBeImported = getNonDeletedResources(statusResult, 'workflow');
+		await this.sourceControlImportService.importWorkflowFromWorkFolder(
+			workflowsToBeImported,
+			user.id,
+		);
+		const workflowsToBeDeleted = getDeletedResources(statusResult, 'workflow');
+		await this.sourceControlImportService.deleteWorkflowsNotInWorkfolder(
+			user,
+			workflowsToBeDeleted,
+		);
+
+		const credentialsToBeImported = getNonDeletedResources(statusResult, 'credential');
+		await this.sourceControlImportService.importCredentialsFromWorkFolder(
+			credentialsToBeImported,
+			user.id,
+		);
+		const credentialsToBeDeleted = getDeletedResources(statusResult, 'credential');
+		await this.sourceControlImportService.deleteCredentialsNotInWorkfolder(
+			user,
+			credentialsToBeDeleted,
+		);
+
+		const tagsToBeImported = getNonDeletedResources(statusResult, 'tags')[0];
+		if (tagsToBeImported) {
+			await this.sourceControlImportService.importTagsFromWorkFolder(tagsToBeImported);
+		}
+		const tagsToBeDeleted = getDeletedResources(statusResult, 'tags');
+		await this.sourceControlImportService.deleteTagsNotInWorkfolder(tagsToBeDeleted);
+
+		const variablesToBeImported = getNonDeletedResources(statusResult, 'variables')[0];
+		if (variablesToBeImported) {
+			await this.sourceControlImportService.importVariablesFromWorkFolder(variablesToBeImported);
+		}
+		const variablesToBeDeleted = getDeletedResources(statusResult, 'variables');
+		await this.sourceControlImportService.deleteVariablesNotInWorkfolder(variablesToBeDeleted);
+
+		const foldersToBeDeleted = getDeletedResources(statusResult, 'folders');
+		await this.sourceControlImportService.deleteFoldersNotInWorkfolder(foldersToBeDeleted);
+
+		const projectsToBeDeleted = getDeletedResources(statusResult, 'project');
+		await this.sourceControlImportService.deleteTeamProjectsNotInWorkfolder(projectsToBeDeleted);
+
+		// #region Tracking Information
+		this.eventService.emit(
+			'source-control-user-finished-pull-ui',
+			getTrackingInformationFromPullResult(user.id, statusResult),
+		);
+		// #endregion
+
+		return {
+			statusCode: 200,
+			statusResult,
+		};
+	}
+
+	async getStatus(user: User, options: SourceControlGetStatus) {
+		await this.sanityCheck();
+
+		if (options.direction === 'push') {
+			await this.ensureCanPushWorkfolder(user);
+		}
+
+		return await this.sourceControlStatusService.getStatus(user, options);
+	}
+
+	async setGitUserDetails(
+		name = SOURCE_CONTROL_DEFAULT_NAME,
+		email = SOURCE_CONTROL_DEFAULT_EMAIL,
+	): Promise<void> {
+		await this.sanityCheck();
+		await this.gitService.setGitUserDetails(name, email);
+	}
+
+	async getRemoteFileEntity({
+		user,
+		type,
+		id,
+		commit = 'HEAD',
+	}: {
+		user: User;
+		type: SourceControlledFile['type'];
+		id?: string;
+		commit?: string;
+	}): Promise<IWorkflowToImport> {
+		await this.sanityCheck();
+		const context = new SourceControlContext(user);
+		switch (type) {
+			case 'workflow': {
+				if (typeof id === 'undefined') {
+					throw new BadRequestError('Workflow ID is required to fetch workflow content');
+				}
+
+				const authorizedWorkflows =
+					await this.sourceControlScopedService.getWorkflowsInAdminProjectsFromContext(context, id);
+				if (authorizedWorkflows && authorizedWorkflows.length === 0) {
+					throw new ForbiddenError(`You are not allowed to access workflow with id ${id}`);
+				}
+				const content = await this.gitService.getFileContent(
+					`${SOURCE_CONTROL_WORKFLOW_EXPORT_FOLDER}/${id}.json`,
+					commit,
+				);
+				return jsonParse<IWorkflowToImport>(content);
+			}
+			default:
+				throw new BadRequestError(`Unsupported file type: ${type}`);
+		}
+	}
+
+	private async ensureCanPushWorkfolder(user: User): Promise<void> {
+		if (await this.gitService.requiresAdminPushForProjectsMigration()) {
+			if (!hasGlobalScope(user, 'sourceControl:push')) {
+				throw new ForbiddenError(SOURCE_CONTROL_ADMIN_PUSH_REQUIRED_MESSAGE);
+			}
+		}
+	}
+}
