@@ -1,0 +1,88 @@
+# Enforce proper resource/operation pattern for better UX in n8n nodes (`@n8n/community-nodes/resource-operation-pattern`)
+
+💼 This rule is enabled in the following configs: ✅ `recommended`, ☑️ `recommendedWithoutN8nCloudSupport`.
+
+<!-- end auto-generated rule header -->
+
+## Rule Details
+
+Reports an error when a regular node has no Operation field or an operation option has no action label. The rule checks only inline properties and options. It skips the action check for triggers and AI-only sub-nodes. A node with one operation still needs an Operation field. A node with one resource can omit the Resource field.
+
+Reports an error when a node has more than 5 operations without resources. Use resources to group related operations. This pattern makes complex nodes easier to navigate.
+
+When you have many operations, users benefit from having them organized into logical resource groups (e.g., "User", "Project", "File") rather than seeing a long flat list of operations.
+
+## Examples
+
+### ❌ Incorrect
+
+```typescript
+export class MyNode implements INodeType {
+  description: INodeTypeDescription = {
+    displayName: 'My Service',
+    name: 'myService',
+    properties: [
+      {
+        displayName: 'Operation',
+        name: 'operation',
+        type: 'options',
+        options: [
+          { name: 'Get User', value: 'getUser', action: 'Get a user' },
+          { name: 'Create User', value: 'createUser', action: 'Create a user' },
+          { name: 'Update User', value: 'updateUser', action: 'Update a user' },
+          { name: 'Delete User', value: 'deleteUser', action: 'Delete a user' },
+          { name: 'Get Project', value: 'getProject', action: 'Get a project' },
+          { name: 'Create Project', value: 'createProject', action: 'Create a project' },
+          { name: 'List Files', value: 'listFiles', action: 'List files' },
+          // 7+ operations without resources - hard to navigate!
+        ],
+      },
+      // ... other properties
+    ],
+  };
+}
+```
+
+### ✅ Correct
+
+```typescript
+export class MyNode implements INodeType {
+  description: INodeTypeDescription = {
+    displayName: 'My Service',
+    name: 'myService',
+    properties: [
+      {
+        displayName: 'Resource',
+        name: 'resource',
+        type: 'options',
+        options: [
+          { name: 'User', value: 'user' },
+          { name: 'Project', value: 'project' },
+          { name: 'File', value: 'file' },
+        ],
+        default: 'user',
+      },
+      {
+        displayName: 'Operation',
+        name: 'operation',
+        type: 'options',
+        displayOptions: {
+          show: {
+            resource: ['user'],
+          },
+        },
+        options: [
+          { name: 'Get', value: 'get', action: 'Get a user' },
+          { name: 'Create', value: 'create', action: 'Create a user' },
+          { name: 'Update', value: 'update', action: 'Update a user' },
+          { name: 'Delete', value: 'delete', action: 'Delete a user' },
+        ],
+        default: 'get',
+      },
+      // ... similar operation blocks for 'project' and 'file' resources
+    ],
+  };
+}
+```
+
+For a node with one resource, omit the Resource field. Keep the Operation field and set `action` on its option.
