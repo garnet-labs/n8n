@@ -1,15 +1,18 @@
 """Unit tests for the n8n shadow dependency mirror."""
 
 import base64
+import datetime
 import pathlib
 import unittest
 
 from mirror import (
+    API,
     FORK,
     SOURCE,
     Mirror,
     is_dependency_pr,
     mirror_revision,
+    recently_merged,
     recording_workflow,
     scrub_title,
 )
@@ -123,6 +126,48 @@ class ShadowMirrorTests(unittest.TestCase):
         mirror.tree("e" * 40)
         final_tree = api.writes[-1][3]["tree"]
         self.assertEqual([item["path"] for item in final_tree], [".github"])
+
+    def test_recently_merged_uses_lookback(self):
+        now = datetime.datetime(2026, 11, 27, tzinfo=datetime.timezone.utc)
+        self.assertTrue(recently_merged({"merged_at": "2026-11-20T00:00:00Z"}, now))
+        self.assertFalse(recently_merged({"merged_at": "2026-11-16T00:00:00Z"}, now))
+        self.assertFalse(recently_merged({"merged_at": None}, now))
+
+    def test_open_backfilled_mirror_stays_in_window(self):
+        now = datetime.datetime(2026, 11, 27, tzinfo=datetime.timezone.utc)
+        pr = {"merged_at": "2026-10-16T00:00:00Z"}
+        fresh = {1: {"state": "open", "created_at": "2026-11-26T00:00:00Z"}}
+        stale = {1: {"state": "open", "created_at": "2026-11-10T00:00:00Z"}}
+        closed = {1: {"state": "closed", "created_at": "2026-11-26T00:00:00Z"}}
+        self.assertTrue(recently_merged(pr, now, fresh))
+        self.assertFalse(recently_merged(pr, now, stale))
+        self.assertFalse(recently_merged(pr, now, closed))
+        self.assertFalse(recently_merged({"merged_at": None}, now, fresh))
+
+    def test_candidates_cover_open_and_recently_merged_bot_changes(self):
+        api = API("unused", True)
+        queries = []
+
+        def fake_request(_path, _method, data):
+            search = data["variables"]["search"]
+            queries.append(search)
+            if "author:app/n8n-cat-bot" in search and "is:open" in search:
+                nodes = [
+                    {"number": 44782, "author": {"login": "n8n-cat-bot"}, "files": {"nodes": [{"path": "pnpm-lock.yaml"}]}},
+                    {"number": 45607, "author": {"login": "n8n-cat-bot"}, "files": {"nodes": [{"path": "packages/cli/src/a.ts"}]}},
+                ]
+            elif "author:app/n8n-cat-bot" in search and "is:merged" in search:
+                nodes = [
+                    {"number": 44010, "author": {"login": "n8n-cat-bot"}, "files": {"nodes": [{"path": "pnpm-lock.yaml"}]}},
+                ]
+            else:
+                nodes = []
+            return {"data": {"search": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}}}
+
+        api._request = fake_request
+        now = datetime.datetime(2026, 11, 27, tzinfo=datetime.timezone.utc)
+        self.assertEqual(list(api.dependency_candidates(now)), [44782, 44010])
+        self.assertTrue(any("is:merged merged:>=2026-11-17T00:00:00Z" in q for q in queries))
 
     def test_dry_run_skips_writes(self):
         base_sha = "1" * 40
