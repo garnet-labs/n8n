@@ -1,0 +1,379 @@
+<script setup lang="ts">
+import {
+	ScrollAreaCorner,
+	ScrollAreaRoot,
+	ScrollAreaScrollbar,
+	ScrollAreaThumb,
+	ScrollAreaViewport,
+} from 'reka-ui';
+import { computed, ref, nextTick, useCssModule, type Ref } from 'vue';
+
+import { useScrollEdges } from '../../composables/useScrollEdges';
+
+/** Viewport edge, or axis, that fades out. Matches the `scroll-mask` mixin. */
+export type ScrollAreaEdgeFade = 'top' | 'bottom' | 'left' | 'right' | 'y' | 'x';
+
+export interface Props {
+	/**
+	 * Controls scrollbar visibility behavior
+	 * - auto: shows scrollbars only when content overflows
+	 * - always: always shows scrollbars
+	 * - scroll: shows scrollbars when scrolling
+	 * - hover: shows scrollbars on hover
+	 * @default 'hover'
+	 */
+	type?: 'auto' | 'always' | 'scroll' | 'hover';
+	/**
+	 * Reading direction for RTL support
+	 * @default 'ltr'
+	 */
+	dir?: 'ltr' | 'rtl';
+	/**
+	 * Time in milliseconds before scrollbars auto-hide
+	 * @default 600
+	 */
+	scrollHideDelay?: number;
+	/**
+	 * Maximum height of the scroll area
+	 */
+	maxHeight?: string;
+	/**
+	 * Maximum width of the scroll area
+	 */
+	maxWidth?: string;
+	/**
+	 * Whether to show horizontal scrollbar
+	 * @default false
+	 */
+	enableHorizontalScroll?: boolean;
+	/**
+	 * Whether to show vertical scrollbar
+	 * @default true
+	 */
+	enableVerticalScroll?: boolean;
+	/**
+	 * Change the default rendered element for the one passed as a child, merging their props and behavior.
+	 * @default false
+	 */
+	asChild?: boolean;
+	/**
+	 * Fade the content out at this edge of the viewport, or at both edges of this axis, while
+	 * content is still hidden past that edge. The fade hides once you reach it, so the last
+	 * item stays solid. The fade is a CSS mask, so it works on any background. Set
+	 * `--scroll-area--fade-size` on the component to change its depth.
+	 */
+	edgeFade?: ScrollAreaEdgeFade;
+}
+
+const props = withDefaults(defineProps<Props>(), {
+	type: 'hover',
+	dir: 'ltr',
+	scrollHideDelay: 600,
+	maxHeight: undefined,
+	maxWidth: undefined,
+	enableHorizontalScroll: false,
+	enableVerticalScroll: true,
+	asChild: false,
+	edgeFade: undefined,
+});
+
+// Type for the ScrollAreaRoot instance with the viewport property
+interface ScrollAreaRootWithViewport {
+	viewport?: Ref<HTMLElement | undefined> | HTMLElement;
+}
+
+const rootRef = ref<ScrollAreaRootWithViewport>();
+const $style = useCssModule();
+
+const viewportStyle = computed(() => {
+	const style: Record<string, string> = {};
+	if (props.maxHeight) {
+		style.maxHeight = props.maxHeight;
+	}
+	if (props.maxWidth) {
+		style.maxWidth = props.maxWidth;
+	}
+	return style;
+});
+
+/**
+ * Gets the viewport element from the root ref
+ */
+function getViewportElement(): HTMLElement | undefined {
+	if (!rootRef.value?.viewport) return undefined;
+
+	const viewport = rootRef.value.viewport;
+
+	// If it's a Vue ref, unwrap it
+	if (typeof viewport === 'object' && 'value' in viewport) {
+		return viewport.value;
+	}
+
+	// If it's already an HTMLElement, use it directly
+	if (viewport instanceof HTMLElement) {
+		return viewport;
+	}
+
+	return undefined;
+}
+
+const fadeTarget = computed(() => (props.edgeFade ? (getViewportElement() ?? null) : null));
+const verticalEdges = useScrollEdges(fadeTarget, { axis: 'vertical' });
+const horizontalEdges = useScrollEdges(fadeTarget, { axis: 'horizontal' });
+
+function isHorizontalFade(edge: ScrollAreaEdgeFade): boolean {
+	return edge === 'left' || edge === 'right' || edge === 'x';
+}
+
+const edgeFadeClass = computed(() => {
+	const edge = props.edgeFade;
+	if (!edge) return undefined;
+
+	const horizontal = isHorizontalFade(edge);
+	const canScrollStart = horizontal
+		? horizontalEdges.canScrollLeft.value
+		: verticalEdges.canScrollTop.value;
+	const canScrollEnd = horizontal
+		? horizontalEdges.canScrollRight.value
+		: verticalEdges.canScrollBottom.value;
+
+	if (edge === 'top') return canScrollStart ? $style.fadeTop : undefined;
+	if (edge === 'bottom') return canScrollEnd ? $style.fadeBottom : undefined;
+	if (edge === 'left') return canScrollStart ? $style.fadeLeft : undefined;
+	if (edge === 'right') return canScrollEnd ? $style.fadeRight : undefined;
+	if (edge === 'y') {
+		if (canScrollStart && canScrollEnd) return $style.fadeY;
+		if (canScrollStart) return $style.fadeTop;
+		if (canScrollEnd) return $style.fadeBottom;
+		return undefined;
+	}
+	if (canScrollStart && canScrollEnd) return $style.fadeX;
+	if (canScrollStart) return $style.fadeLeft;
+	if (canScrollEnd) return $style.fadeRight;
+	return undefined;
+});
+
+/**
+ * Scrolls the viewport to the bottom
+ * @param options - Options for controlling scroll behavior
+ */
+async function scrollToBottom(options: { smooth?: boolean } = {}) {
+	// Wait for DOM updates to ensure content is fully rendered
+	await nextTick();
+
+	const viewport = getViewportElement();
+
+	if (viewport && typeof viewport.scrollTo === 'function') {
+		viewport.scrollTo({
+			top: viewport.scrollHeight,
+			behavior: options.smooth ? 'smooth' : 'auto',
+		});
+	} else if (viewport) {
+		// Fallback for test environments or browsers that don't support scrollTo
+		viewport.scrollTop = viewport.scrollHeight;
+	}
+}
+
+/**
+ * Scrolls the viewport to the top
+ * @param options - Options for controlling scroll behavior
+ */
+async function scrollToTop(options: { smooth?: boolean } = {}) {
+	await nextTick();
+
+	const viewport = getViewportElement();
+
+	if (viewport && typeof viewport.scrollTo === 'function') {
+		viewport.scrollTo({
+			top: 0,
+			behavior: options.smooth ? 'smooth' : 'auto',
+		});
+	} else if (viewport) {
+		// Fallback for test environments or browsers that don't support scrollTo
+		viewport.scrollTop = 0;
+	}
+}
+
+/**
+ * Gets the current scroll position
+ */
+function getScrollPosition() {
+	const viewport = getViewportElement();
+
+	if (viewport) {
+		return {
+			top: viewport.scrollTop,
+			left: viewport.scrollLeft,
+			height: viewport.scrollHeight,
+			width: viewport.scrollWidth,
+		};
+	}
+	return null;
+}
+
+defineExpose({
+	scrollToBottom,
+	scrollToTop,
+	getScrollPosition,
+});
+</script>
+
+<template>
+	<ScrollAreaRoot
+		ref="rootRef"
+		:type="type"
+		:dir="dir"
+		:scroll-hide-delay="scrollHideDelay"
+		:class="$style.scrollAreaRoot"
+	>
+		<ScrollAreaViewport
+			:as-child="asChild"
+			:class="[$style.viewport, edgeFadeClass]"
+			:style="viewportStyle"
+		>
+			<slot />
+		</ScrollAreaViewport>
+
+		<ScrollAreaScrollbar
+			v-if="enableVerticalScroll"
+			orientation="vertical"
+			:class="$style.scrollbar"
+		>
+			<ScrollAreaThumb :class="$style.thumb" />
+		</ScrollAreaScrollbar>
+
+		<ScrollAreaScrollbar
+			v-if="enableHorizontalScroll"
+			orientation="horizontal"
+			:class="$style.scrollbar"
+		>
+			<ScrollAreaThumb :class="$style.thumb" />
+		</ScrollAreaScrollbar>
+
+		<ScrollAreaCorner v-if="enableHorizontalScroll && enableVerticalScroll" />
+	</ScrollAreaRoot>
+</template>
+
+<style lang="scss" module>
+@use '../../css/mixins/mixins';
+
+.scrollAreaRoot {
+	position: relative;
+	overflow: hidden;
+	width: 100%;
+	height: 100%;
+	contain: layout style;
+}
+
+.viewport {
+	width: 100%;
+	height: 100%;
+	border-radius: inherit;
+	overflow-anchor: none;
+}
+
+/* The mask sits on the viewport, so the scrollbar next to it stays untouched. */
+$fade-size: var(--scroll-area--fade-size, var(--spacing--sm));
+
+.fadeTop {
+	scroll-padding-top: $fade-size;
+	@include mixins.scroll-mask(top, $fade-size);
+}
+
+.fadeBottom {
+	scroll-padding-bottom: $fade-size;
+	@include mixins.scroll-mask(bottom, $fade-size);
+}
+
+.fadeLeft {
+	scroll-padding-left: $fade-size;
+	@include mixins.scroll-mask(left, $fade-size);
+}
+
+.fadeRight {
+	scroll-padding-right: $fade-size;
+	@include mixins.scroll-mask(right, $fade-size);
+}
+
+.fadeY {
+	scroll-padding-top: $fade-size;
+	scroll-padding-bottom: $fade-size;
+	@include mixins.scroll-mask(y, $fade-size);
+}
+
+.fadeX {
+	scroll-padding-left: $fade-size;
+	scroll-padding-right: $fade-size;
+	@include mixins.scroll-mask(x, $fade-size);
+}
+
+.scrollbar {
+	display: flex;
+	user-select: none;
+	touch-action: none;
+	padding: var(--spacing--5xs);
+	background: transparent;
+	transition: background 160ms ease-out;
+	pointer-events: none;
+
+	&:hover {
+		background: var(--color--foreground--tint-1);
+	}
+
+	&[data-orientation='vertical'] {
+		width: var(--spacing--2xs);
+	}
+
+	&[data-orientation='horizontal'] {
+		height: var(--spacing--2xs);
+		flex-direction: row;
+	}
+}
+
+.thumb {
+	flex: 1;
+	background: var(--color--foreground);
+	border-radius: 4px;
+	position: relative;
+	pointer-events: auto;
+
+	&:hover {
+		background: var(--color--foreground--shade-1);
+	}
+
+	&:active {
+		background: var(--color--foreground--shade-2);
+	}
+}
+
+// Style the scrollbar when type is 'always' to be more subtle
+.scrollAreaRoot[data-type='always'] {
+	.scrollbar {
+		background: var(--color--foreground--tint-2);
+
+		&:hover {
+			background: var(--color--foreground--tint-1);
+		}
+	}
+
+	.thumb {
+		background: var(--color--foreground--tint-1);
+
+		&:hover {
+			background: var(--color--foreground);
+		}
+	}
+}
+
+// Enhanced styling for hover type
+.scrollAreaRoot[data-type='hover'] {
+	.scrollbar {
+		opacity: 0;
+		transition: opacity 160ms ease-out;
+	}
+
+	&:hover .scrollbar {
+		opacity: 1;
+	}
+}
+</style>
