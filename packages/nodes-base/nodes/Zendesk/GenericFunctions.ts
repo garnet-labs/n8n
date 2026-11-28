@@ -1,0 +1,124 @@
+import type {
+	IDataObject,
+	IExecuteFunctions,
+	IHookFunctions,
+	ILoadOptionsFunctions,
+	IHttpRequestMethods,
+	IRequestOptions,
+	RequestPath,
+	WithRequestTarget,
+} from 'n8n-workflow';
+import { requestUrl } from 'n8n-workflow';
+
+type ZendeskCredentials = {
+	subdomain: string;
+	marketplaceName?: string;
+	marketplaceOrganizationId?: string;
+	marketplaceAppId?: string;
+};
+
+function getMarketplaceHeaders(credentials: ZendeskCredentials): IDataObject | undefined {
+	const headers = {
+		'X-Zendesk-Marketplace-Name': credentials.marketplaceName,
+		'X-Zendesk-Marketplace-Organization-Id': credentials.marketplaceOrganizationId,
+		'X-Zendesk-Marketplace-App-Id': credentials.marketplaceAppId,
+	};
+
+	return Object.values(headers).every(Boolean) ? headers : undefined;
+}
+
+function getUri(resource: RequestPath, subdomain: string) {
+	if (resource.value.includes('webhooks')) {
+		return requestUrl`https://${subdomain}.zendesk.com/api/v2${resource}`;
+	} else {
+		return requestUrl`https://${subdomain}.zendesk.com/api/v2${resource}.json`;
+	}
+}
+
+export async function zendeskApiRequest(
+	this: IHookFunctions | IExecuteFunctions | ILoadOptionsFunctions,
+	method: IHttpRequestMethods,
+	resource: RequestPath,
+
+	body: any = {},
+	qs: IDataObject = {},
+	uri?: string,
+	option: Pick<IRequestOptions, 'headers'> = {},
+) {
+	const authenticationMethod = this.getNodeParameter('authentication', 0);
+
+	let credentials: ZendeskCredentials;
+
+	if (authenticationMethod === 'apiToken') {
+		credentials = await this.getCredentials<ZendeskCredentials>('zendeskApi');
+	} else {
+		credentials = await this.getCredentials<ZendeskCredentials>('zendeskOAuth2Api');
+	}
+
+	let options: IRequestOptions | WithRequestTarget<IRequestOptions, 'uri'> = {
+		method,
+		qs,
+		body,
+		...(uri ? { uri } : { uri: getUri(resource, credentials.subdomain) }),
+		json: true,
+		qsStringifyOptions: {
+			arrayFormat: 'brackets',
+		},
+	};
+
+	options = Object.assign({}, options, option);
+	if (Object.keys(options.body as IDataObject).length === 0) {
+		delete options.body;
+	}
+
+	const marketplaceHeaders = getMarketplaceHeaders(credentials);
+	if (marketplaceHeaders) {
+		options.headers = { ...(options.headers ?? {}), ...marketplaceHeaders };
+	}
+
+	const credentialType = authenticationMethod === 'apiToken' ? 'zendeskApi' : 'zendeskOAuth2Api';
+
+	return await this.helpers.requestWithAuthentication.call(this, credentialType, options);
+}
+
+/**
+ * Make an API request to paginated flow endpoint
+ * and return all results
+ */
+export async function zendeskApiRequestAllItems(
+	this: IHookFunctions | IExecuteFunctions | ILoadOptionsFunctions,
+	propertyName: string,
+	method: IHttpRequestMethods,
+	resource: RequestPath,
+
+	body: any = {},
+	query: IDataObject = {},
+): Promise<any> {
+	const returnData: IDataObject[] = [];
+
+	let responseData;
+
+	let uri: string | undefined;
+
+	do {
+		responseData = await zendeskApiRequest.call(this, method, resource, body, query, uri);
+		uri = responseData.next_page;
+		returnData.push.apply(returnData, responseData[propertyName] as IDataObject[]);
+		const limit = query.limit as number | undefined;
+		if (limit && limit <= returnData.length) {
+			return returnData;
+		}
+	} while (responseData.next_page !== undefined && responseData.next_page !== null);
+
+	return returnData;
+}
+
+export function validateJSON(json: string | undefined): any {
+	let result;
+	try {
+		result = JSON.parse(json!);
+	} catch (exception) {
+		result = undefined;
+	}
+	return result;
+}
