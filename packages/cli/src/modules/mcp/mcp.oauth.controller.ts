@@ -1,0 +1,153 @@
+import { InvalidRequestError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { authorizationHandler } from '@modelcontextprotocol/sdk/server/auth/handlers/authorize.js';
+import { clientRegistrationHandler } from '@modelcontextprotocol/sdk/server/auth/handlers/register.js';
+import { revocationHandler } from '@modelcontextprotocol/sdk/server/auth/handlers/revoke.js';
+import { tokenHandler } from '@modelcontextprotocol/sdk/server/auth/handlers/token.js';
+import { Get, Options, RootLevelController, StaticRouterMetadata } from '@n8n/decorators';
+import { Container } from '@n8n/di';
+import type { Response, Request, RequestHandler, Router } from 'express';
+import { z } from 'zod/v4';
+
+import { UrlService } from '@/services/url.service';
+
+import { McpOAuthService, SUPPORTED_SCOPES } from './mcp-oauth-service';
+import { MCP_ACCESS_DISABLED_ERROR_MESSAGE } from './mcp.constants';
+import { McpSettingsService } from './mcp.settings.service';
+
+const mcpOAuthService = Container.get(McpOAuthService);
+const mcpSettingsService = Container.get(McpSettingsService);
+
+/**
+ * Middleware that rejects requests when MCP access is disabled.
+ * Prevents unauthenticated access to OAuth endpoints when MCP is turned off.
+ */
+const mcpEnabledGuard: RequestHandler = async (_req, res, next) => {
+	const enabled = await mcpSettingsService.getEnabled();
+	if (!enabled) {
+		res.status(403).json({ error: MCP_ACCESS_DISABLED_ERROR_MESSAGE });
+		return;
+	}
+	next();
+};
+
+/**
+ * Mirrors the SDK's `RequestAuthorizationParamsSchema`, which it does not
+ * export: the authorization request parameters it checks after it has
+ * resolved the client.
+ */
+const authorizationRequestParamsSchema = z.object({
+	response_type: z.literal('code'),
+	code_challenge: z.string(),
+	code_challenge_method: z.literal('S256'),
+	scope: z.string().optional(),
+	state: z.string().optional(),
+	resource: z.url().optional(),
+});
+
+/**
+ * Validates the authorization request parameters before the SDK handler runs,
+ * so that every invalid request gets a direct error response.
+ */
+const authorizationRequestValidator: RequestHandler = (req, res, next) => {
+	const result = authorizationRequestParamsSchema.safeParse(
+		req.method === 'POST' ? req.body : req.query,
+	);
+	if (result.success) {
+		next();
+		return;
+	}
+	res.setHeader('Cache-Control', 'no-store');
+	res.status(400).json(new InvalidRequestError(result.error.message).toResponseObject());
+};
+
+@RootLevelController('/')
+export class McpOAuthController {
+	constructor(private readonly urlService: UrlService) {}
+
+	// Add CORS headers for OAuth discovery endpoints
+	private setCorsHeaders(res: Response) {
+		// Allow requests from any origin for OAuth discovery
+		res.header('Access-Control-Allow-Origin', '*');
+		res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+		res.header('Access-Control-Allow-Headers', 'Content-Type');
+	}
+
+	static routers: StaticRouterMetadata[] = [
+		{
+			path: '/mcp-oauth/register',
+			router: clientRegistrationHandler({ clientsStore: mcpOAuthService.clientsStore }) as Router,
+			skipAuth: true,
+			middlewares: [mcpEnabledGuard],
+		},
+		{
+			path: '/mcp-oauth/authorize',
+			router: authorizationHandler({ provider: mcpOAuthService }) as Router,
+			skipAuth: true,
+			middlewares: [mcpEnabledGuard, authorizationRequestValidator],
+		},
+		{
+			path: '/mcp-oauth/token',
+			router: tokenHandler({ provider: mcpOAuthService }) as Router,
+			skipAuth: true,
+			middlewares: [mcpEnabledGuard],
+		},
+		{
+			path: '/mcp-oauth/revoke',
+			router: revocationHandler({ provider: mcpOAuthService }) as Router,
+			skipAuth: true,
+			middlewares: [mcpEnabledGuard],
+		},
+	];
+
+	@Options('/.well-known/oauth-authorization-server', { skipAuth: true, usesTemplates: true })
+	metadataOptions(_req: Request, res: Response) {
+		this.setCorsHeaders(res);
+		res.status(204).end();
+	}
+
+	@Get('/.well-known/oauth-authorization-server', { skipAuth: true, usesTemplates: true })
+	metadata(_req: Request, res: Response) {
+		this.setCorsHeaders(res);
+
+		const baseUrl = this.urlService.getInstanceBaseUrl();
+		const metadata = {
+			issuer: baseUrl,
+			authorization_endpoint: `${baseUrl}/mcp-oauth/authorize`,
+			token_endpoint: `${baseUrl}/mcp-oauth/token`,
+			registration_endpoint: `${baseUrl}/mcp-oauth/register`,
+			revocation_endpoint: `${baseUrl}/mcp-oauth/revoke`,
+			response_types_supported: ['code'],
+			grant_types_supported: ['authorization_code', 'refresh_token'],
+			token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
+			code_challenge_methods_supported: ['S256'],
+			scopes_supported: SUPPORTED_SCOPES,
+		};
+
+		res.json(metadata);
+	}
+
+	@Options('/.well-known/oauth-protected-resource/mcp-server/http', {
+		skipAuth: true,
+		usesTemplates: true,
+	})
+	protectedResourceMetadataOptions(_req: Request, res: Response) {
+		this.setCorsHeaders(res);
+		res.status(204).end();
+	}
+
+	@Get('/.well-known/oauth-protected-resource/mcp-server/http', {
+		skipAuth: true,
+		usesTemplates: true,
+	})
+	protectedResourceMetadata(_req: Request, res: Response) {
+		this.setCorsHeaders(res);
+
+		const baseUrl = this.urlService.getInstanceBaseUrl();
+		res.json({
+			resource: `${baseUrl}/mcp-server/http`,
+			bearer_methods_supported: ['header'],
+			authorization_servers: [baseUrl],
+			scopes_supported: SUPPORTED_SCOPES,
+		});
+	}
+}
