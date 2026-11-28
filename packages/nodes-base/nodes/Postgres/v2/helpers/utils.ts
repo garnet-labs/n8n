@@ -1,0 +1,1018 @@
+import type {
+	IDataObject,
+	IExecuteFunctions,
+	INode,
+	INodeExecutionData,
+	INodePropertyOptions,
+	NodeParameterValueType,
+} from 'n8n-workflow';
+import { NodeOperationError, deepCopy, jsonParse } from 'n8n-workflow';
+
+import type {
+	ColumnInfo,
+	EnumInfo,
+	PgpClient,
+	PgpDatabase,
+	PostgresNodeOptions,
+	QueriesRunner,
+	QueryMode,
+	QueryValues,
+	QueryWithValues,
+	SortRule,
+	StartAfter,
+	WhereClause,
+} from './interfaces';
+import { generatePairedItemData } from '../../../../utils/utilities';
+import { operatorOptions } from '../actions/common.descriptions';
+
+export function isJSON(str: string) {
+	try {
+		JSON.parse(str.trim());
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+export function evaluateExpression(expression: NodeParameterValueType) {
+	if (expression === undefined) {
+		return '';
+	} else if (expression === null) {
+		return 'null';
+	} else {
+		return typeof expression === 'object' ? JSON.stringify(expression) : expression.toString();
+	}
+}
+
+export function stringToArray(str: NodeParameterValueType | undefined) {
+	if (str === undefined) return [];
+	return String(str)
+		.split(',')
+		.filter((entry) => entry)
+		.map((entry) => entry.trim());
+}
+
+export function wrapData(data: IDataObject | IDataObject[]): INodeExecutionData[] {
+	if (!Array.isArray(data)) {
+		return [{ json: data }];
+	}
+	return data.map((item) => ({
+		json: item,
+	}));
+}
+
+export function prepareErrorItem(error: IDataObject | NodeOperationError | Error, index: number) {
+	return {
+		json: { error: { ...error } },
+		pairedItem: { item: index },
+	} as INodeExecutionData;
+}
+
+export function parsePostgresError(
+	node: INode,
+	error: any,
+	queries: QueryWithValues[],
+	itemIndex?: number,
+) {
+	if (error.message.includes('syntax error at or near') && queries.length) {
+		try {
+			const snippet = error.message.match(/syntax error at or near "(.*)"/)[1] as string;
+			const failedQureryIndex = queries.findIndex((query) => query.query.includes(snippet));
+
+			if (failedQureryIndex !== -1) {
+				if (!itemIndex) {
+					itemIndex = failedQureryIndex;
+				}
+				const failedQuery = queries[failedQureryIndex].query;
+				const lines = failedQuery.split('\n');
+				const lineIndex = lines.findIndex((line) => line.includes(snippet));
+				const errorMessage = `Syntax error at line ${lineIndex + 1} near "${snippet}"`;
+				error.message = errorMessage;
+			}
+		} catch {}
+	}
+
+	let message = error.message;
+	const errorDescription = error.description ? error.description : error.detail || error.hint;
+	let description = errorDescription;
+
+	if (!description && queries[itemIndex || 0]?.query) {
+		description = `Failed query: ${queries[itemIndex || 0].query}`;
+	}
+
+	if (error.message.includes('ECONNREFUSED')) {
+		message = 'Connection refused';
+		try {
+			description = error.message.split('ECONNREFUSED ')[1].trim();
+		} catch (e) {}
+	}
+
+	if (error.message.includes('ENOTFOUND')) {
+		message = 'Host not found';
+		try {
+			description = error.message.split('ENOTFOUND ')[1].trim();
+		} catch (e) {}
+	}
+
+	if (error.message.includes('ETIMEDOUT')) {
+		message = 'Connection timed out';
+		try {
+			description = error.message.split('ETIMEDOUT ')[1].trim();
+		} catch (e) {}
+	}
+
+	return new NodeOperationError(node, error as Error, {
+		message,
+		description,
+		itemIndex,
+	});
+}
+
+/**
+ * Wrap an error thrown while loading node parameters (resource mapper columns,
+ * dropdown options, list search) into a user-facing `NodeOperationError`.
+ * These run during node configuration and routinely fail for reasons the user
+ * controls (missing table, bad credentials, unreachable host). Passing the
+ * message as a string makes the error `warning` level, so it is shown to the
+ * user but not reported to Sentry as if it were an n8n bug.
+ */
+export function parseParameterLoadingError(node: INode, error: unknown): NodeOperationError {
+	if (error instanceof NodeOperationError) return error;
+	const message = error instanceof Error ? error.message : String(error);
+	return new NodeOperationError(node, message);
+}
+
+function buildWhereConditions(
+	clauses: WhereClause[],
+	replacements: QueryValues,
+	combineConditions: string,
+): [string, QueryValues] {
+	const combineWith = combineConditions === 'OR' ? 'OR' : 'AND';
+
+	let replacementIndex = replacements.length + 1;
+
+	const conditions: string[] = [];
+	const values: QueryValues = [];
+
+	clauses.forEach((clause) => {
+		if (clause.condition === 'equal') {
+			clause.condition = '=';
+		}
+		if (['>', '<', '>=', '<='].includes(clause.condition)) {
+			const numericValue = Number(clause.value);
+			if (String(clause.value).trim() !== '' && !Number.isNaN(numericValue)) {
+				clause.value = numericValue;
+			}
+		}
+		const columnReplacement = `$${replacementIndex}:name`;
+		values.push(clause.column);
+		replacementIndex = replacementIndex + 1;
+
+		let valueReplacement = '';
+		if (clause.condition !== 'IS NULL' && clause.condition !== 'IS NOT NULL') {
+			valueReplacement = ` $${replacementIndex}`;
+			values.push(clause.value);
+			replacementIndex = replacementIndex + 1;
+		}
+
+		conditions.push(`${columnReplacement} ${clause.condition}${valueReplacement}`);
+	});
+
+	return [conditions.join(` ${combineWith} `), replacements.concat(...values)];
+}
+
+export function addWhereClauses(
+	_node: INode,
+	_itemIndex: number,
+	query: string,
+	clauses: WhereClause[],
+	replacements: QueryValues,
+	combineConditions: string,
+): [string, QueryValues] {
+	if (clauses.length === 0) return [query, replacements];
+
+	const [conditions, values] = buildWhereConditions(clauses, replacements, combineConditions);
+
+	return [`${query} WHERE ${conditions}`, values];
+}
+
+/**
+ * Adds the Start After condition after the user's conditions. The brackets keep
+ * an OR in the user's conditions from also matching rows before the cursor.
+ * The value stays text, so Postgres casts it to the type of the column.
+ */
+export function addStartAfterClause(
+	query: string,
+	clauses: WhereClause[],
+	replacements: QueryValues,
+	combineConditions: string,
+	startAfter: StartAfter,
+	descending: boolean,
+): [string, QueryValues] {
+	const [conditions, values]: [string, QueryValues] =
+		clauses.length === 0
+			? ['', replacements]
+			: buildWhereConditions(clauses, replacements, combineConditions);
+
+	if (startAfter.value === undefined) {
+		return [conditions ? `${query} WHERE ${conditions}` : query, values];
+	}
+
+	const withCursor = [...values, startAfter.column, startAfter.value];
+	const cursorCondition = `$${withCursor.length - 1}:name ${descending ? '<' : '>'} $${withCursor.length}`;
+
+	return [
+		`${query} WHERE ${conditions ? `(${conditions}) AND ` : ''}${cursorCondition}`,
+		withCursor,
+	];
+}
+
+export function addSortRules(
+	query: string,
+	rules: SortRule[],
+	replacements: QueryValues,
+): [string, QueryValues] {
+	if (rules.length === 0) return [query, replacements];
+
+	let replacementIndex = replacements.length + 1;
+
+	let orderByQuery = ' ORDER BY';
+	const values: string[] = [];
+
+	rules.forEach((rule, index) => {
+		const columnReplacement = `$${replacementIndex}:name`;
+		values.push(rule.column);
+		replacementIndex = replacementIndex + 1;
+
+		const endWith = index === rules.length - 1 ? '' : ',';
+
+		const sortDirection = rule.direction === 'DESC' ? 'DESC' : 'ASC';
+
+		orderByQuery += ` ${columnReplacement} ${sortDirection}${endWith}`;
+	});
+
+	return [`${query}${orderByQuery}`, replacements.concat(...values)];
+}
+
+export function addReturning(
+	query: string,
+	outputColumns: string[],
+	replacements: QueryValues,
+): [string, QueryValues] {
+	if (outputColumns.includes('*')) return [`${query} RETURNING *`, replacements];
+
+	const replacementIndex = replacements.length + 1;
+
+	return [`${query} RETURNING $${replacementIndex}:name`, [...replacements, outputColumns]];
+}
+
+// Strip SQL comments and string literals so they can't interfere with statement
+// classification. Strings collapse to empty quotes / empty dollar tags so paren and
+// semicolon structure outside strings is preserved.
+
+// `\` is an escape only inside E-strings (`E'...'`). For standard strings, with
+// `standard_conforming_strings = on` (PG default since 9.1), `\` is a literal.
+// The `E` prefix must be a standalone token, not the trailing char of an identifier.
+const isEStringPrefix = (query: string, quoteIndex: number): boolean => {
+	if (quoteIndex === 0) return false;
+	const prev = query[quoteIndex - 1];
+	if (prev !== 'E' && prev !== 'e') return false;
+	if (quoteIndex === 1) return true;
+	return !/[A-Za-z0-9_]/.test(query[quoteIndex - 2]);
+};
+
+const stripStringsAndComments = (query: string): string => {
+	const len = query.length;
+	let out = '';
+	let i = 0;
+	while (i < len) {
+		const c = query[i];
+		const next = query[i + 1];
+
+		if (c === '/' && next === '*') {
+			const end = query.indexOf('*/', i + 2);
+			i = end === -1 ? len : end + 2;
+			out += ' ';
+			continue;
+		}
+
+		if (c === '-' && next === '-') {
+			const newline = query.indexOf('\n', i + 2);
+			i = newline === -1 ? len : newline;
+			out += ' ';
+			continue;
+		}
+
+		if (c === "'") {
+			const allowBackslashEscape = isEStringPrefix(query, i);
+			i++;
+			while (i < len) {
+				if (allowBackslashEscape && query[i] === '\\' && i + 1 < len) {
+					i += 2;
+					continue;
+				}
+				if (query[i] === "'") {
+					if (query[i + 1] === "'") {
+						i += 2;
+						continue;
+					}
+					i++;
+					break;
+				}
+				i++;
+			}
+			out += "''";
+			continue;
+		}
+
+		if (c === '"') {
+			i++;
+			while (i < len && query[i] !== '"') {
+				if (query[i] === '\\' && i + 1 < len) {
+					i += 2;
+					continue;
+				}
+				i++;
+			}
+			if (i < len) i++;
+			out += '""';
+			continue;
+		}
+
+		if (c === '$') {
+			const tagMatch = query.slice(i).match(/^\$[A-Za-z_][A-Za-z0-9_]*\$|^\$\$/);
+			if (tagMatch) {
+				const tag = tagMatch[0];
+				const end = query.indexOf(tag, i + tag.length);
+				i = end === -1 ? len : end + tag.length;
+				out += ' ';
+				continue;
+			}
+		}
+
+		out += c;
+		i++;
+	}
+	return out;
+};
+
+// Split on `;` outside of string literals. Since `stripStringsAndComments` already
+// removes string contents, a simple split on the stripped query is safe.
+const splitStatements = (stripped: string): string[] =>
+	stripped
+		.split(';')
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0);
+
+// Returns the top-level command keyword (SELECT/INSERT/UPDATE/DELETE/MERGE) of a
+// single statement, skipping anything inside parentheses (CTE bodies, subqueries).
+// `WITH foo AS (...) UPDATE ...` resolves to UPDATE, not WITH.
+const TOP_LEVEL_COMMANDS = new Set(['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE']);
+
+const findTopLevelCommand = (statement: string): string | null => {
+	const upper = statement.toUpperCase();
+	let depth = 0;
+	let i = 0;
+	while (i < statement.length) {
+		const c = statement[i];
+		if (c === '(') {
+			depth++;
+			i++;
+			continue;
+		}
+		if (c === ')') {
+			if (depth > 0) depth--;
+			i++;
+			continue;
+		}
+		if (depth === 0 && /[A-Za-z_]/.test(c)) {
+			let j = i;
+			while (j < statement.length && /[A-Za-z0-9_]/.test(statement[j])) j++;
+			const word = upper.slice(i, j);
+			if (TOP_LEVEL_COMMANDS.has(word)) {
+				return word;
+			}
+			i = j;
+			continue;
+		}
+		i++;
+	}
+	return null;
+};
+
+export const isSelectQuery = (query: string): boolean => {
+	const statements = splitStatements(stripStringsAndComments(query));
+	if (statements.length === 0) return true;
+	return statements.every((statement) => findTopLevelCommand(statement) === 'SELECT');
+};
+
+export function configureQueryRunner(
+	this: IExecuteFunctions,
+	node: INode,
+	continueOnFail: boolean,
+	pgp: PgpClient,
+	db: PgpDatabase,
+): QueriesRunner {
+	return async (queries: QueryWithValues[], options: IDataObject) => {
+		let returnData: INodeExecutionData[] = [];
+		const emptyReturnData: INodeExecutionData[] =
+			options.operation === 'select' ? [] : [{ json: { success: true } }];
+
+		const queryBatching = (options.queryBatching as QueryMode) || 'single';
+
+		if (queryBatching === 'single') {
+			try {
+				returnData = (await db.multi(pgp.helpers.concat(queries)))
+					.map((result, i) => {
+						return this.helpers.constructExecutionMetaData(wrapData(result as IDataObject[]), {
+							itemData: { item: i },
+						});
+					})
+					.flat();
+
+				if (!returnData.length) {
+					const pairedItem = generatePairedItemData(queries.length);
+
+					if ((options?.nodeVersion as number) < 2.3) {
+						if (emptyReturnData.length) {
+							emptyReturnData[0].pairedItem = pairedItem;
+						}
+						returnData = emptyReturnData;
+					} else {
+						returnData = queries.every((query) => isSelectQuery(query.query))
+							? []
+							: [{ json: { success: true }, pairedItem }];
+					}
+				}
+			} catch (err) {
+				const error = parsePostgresError(node, err, queries);
+				if (!continueOnFail) throw error;
+
+				return [
+					{
+						json: {
+							message: error.message,
+							error: { ...error },
+						},
+					},
+				];
+			}
+		}
+
+		if (queryBatching === 'transaction') {
+			returnData = await db.tx(async (transaction) => {
+				const result: INodeExecutionData[] = [];
+				for (let i = 0; i < queries.length; i++) {
+					try {
+						const query = queries[i].query;
+						const values = queries[i].values;
+
+						let transactionResults;
+						if ((options?.nodeVersion as number) < 2.3) {
+							transactionResults = await transaction.any(query, values);
+						} else {
+							transactionResults = (await transaction.multi(query, values)).flat();
+						}
+
+						if (!transactionResults.length) {
+							if ((options?.nodeVersion as number) < 2.3) {
+								transactionResults = emptyReturnData;
+							} else {
+								transactionResults = isSelectQuery(query) ? [] : [{ success: true }];
+							}
+						}
+
+						const executionData = this.helpers.constructExecutionMetaData(
+							wrapData(transactionResults),
+							{ itemData: { item: i } },
+						);
+
+						result.push(...executionData);
+					} catch (err) {
+						const error = parsePostgresError(node, err, queries, i);
+						if (!continueOnFail) throw error;
+						result.push(prepareErrorItem(error, i));
+						return result;
+					}
+				}
+				return result;
+			});
+		}
+
+		if (queryBatching === 'independently') {
+			returnData = await db.task(async (task) => {
+				const result: INodeExecutionData[] = [];
+				for (let i = 0; i < queries.length; i++) {
+					try {
+						const query = queries[i].query;
+						const values = queries[i].values;
+
+						let transactionResults;
+						if ((options?.nodeVersion as number) < 2.3) {
+							transactionResults = await task.any(query, values);
+						} else {
+							transactionResults = (await task.multi(query, values)).flat();
+						}
+
+						if (!transactionResults.length) {
+							if ((options?.nodeVersion as number) < 2.3) {
+								transactionResults = emptyReturnData;
+							} else {
+								transactionResults = isSelectQuery(query) ? [] : [{ success: true }];
+							}
+						}
+
+						const executionData = this.helpers.constructExecutionMetaData(
+							wrapData(transactionResults),
+							{ itemData: { item: i } },
+						);
+
+						result.push(...executionData);
+					} catch (err) {
+						const error = parsePostgresError(node, err, queries, i);
+						if (!continueOnFail) throw error;
+						result.push(prepareErrorItem(error, i));
+					}
+				}
+				return result;
+			});
+		}
+
+		return returnData;
+	};
+}
+
+export function replaceEmptyStringsByNulls(
+	items: INodeExecutionData[],
+	replace?: boolean,
+): INodeExecutionData[] {
+	if (!replace) return items;
+
+	const returnData: INodeExecutionData[] = items.map((item) => {
+		const newItem = { ...item };
+		const keys = Object.keys(newItem.json);
+
+		for (const key of keys) {
+			if (newItem.json[key] === '') {
+				newItem.json[key] = null;
+			}
+		}
+
+		return newItem;
+	});
+
+	return returnData;
+}
+
+export function prepareItem(values: IDataObject[]) {
+	const item = values.reduce((acc, { column, value }) => {
+		acc[column as string] = value;
+		return acc;
+	}, {} as IDataObject);
+
+	return item;
+}
+
+export function hasJsonDataTypeInSchema(schema: ColumnInfo[]) {
+	return schema.some(({ data_type }) => data_type === 'json');
+}
+
+export function convertValuesToJsonWithPgp(
+	pgp: PgpClient,
+	schema: ColumnInfo[],
+	values: IDataObject,
+) {
+	schema
+		.filter(
+			({ data_type, column_name }) =>
+				data_type === 'json' && values[column_name] !== null && values[column_name] !== undefined,
+		)
+		.forEach(({ column_name }) => {
+			values[column_name] = pgp.as.json(values[column_name], true);
+		});
+
+	return values;
+}
+
+export async function columnFeatureSupport(
+	db: PgpDatabase,
+): Promise<{ identity_generation: boolean; is_generated: boolean }> {
+	const result = await db.any(
+		`SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns WHERE table_name = 'columns' AND table_schema = 'information_schema' AND column_name = 'is_generated'
+		) as is_generated,
+		EXISTS (
+			SELECT 1 FROM information_schema.columns WHERE table_name = 'columns' AND table_schema = 'information_schema' AND column_name = 'identity_generation'
+		) as identity_generation;`,
+	);
+
+	return result[0];
+}
+
+export async function getTableSchema(
+	db: PgpDatabase,
+	schema: string,
+	table: string,
+	options?: { getColumnsForResourceMapper?: boolean },
+): Promise<ColumnInfo[]> {
+	const select = ['column_name', 'data_type', 'is_nullable', 'udt_name', 'column_default'];
+
+	if (options?.getColumnsForResourceMapper) {
+		// Check if columns exist before querying (identity_generation was added in v10, is_generated in v12)
+		const supported = await columnFeatureSupport(db);
+
+		if (supported.identity_generation) {
+			select.push('identity_generation');
+		}
+
+		if (supported.is_generated) {
+			select.push('is_generated');
+		}
+	}
+
+	const selectString = select.join(', ');
+	const columns = await db.any(
+		`SELECT ${selectString} FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2`,
+		[schema, table],
+	);
+
+	return columns;
+}
+
+export async function uniqueColumns(db: PgpDatabase, table: string, schema = 'public') {
+	// Using the modified query from https://wiki.postgresql.org/wiki/Retrieve_primary_key_columns
+	// `quote_ident` - properly quote and escape an identifier
+	// `::regclass` - cast a string to a regclass (internal type for object names)
+	const unique = await db.any(
+		`
+		SELECT DISTINCT a.attname
+			FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+		WHERE i.indrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass
+			AND (i.indisprimary OR i.indisunique);
+		`,
+		[schema, table],
+	);
+	return unique as IDataObject[];
+}
+
+type StartAfterColumnInfo = {
+	data_type: string;
+	is_text: boolean;
+	not_null: boolean;
+	is_unique: boolean;
+	has_child_tables: boolean;
+};
+
+/**
+ * Reads what Start After needs about the column from the catalog in one query, because the node checks it before each page.
+ * indnkeyatts leaves out INCLUDE columns. PostgreSQL 10 does not have it, so the query reads it through to_jsonb.
+ * A select also gets the rows of child tables, but a unique index covers one table. A partitioned table is safe.
+ */
+async function getStartAfterColumnInfo(
+	db: PgpDatabase,
+	schema: string,
+	table: string,
+	column: string,
+): Promise<StartAfterColumnInfo | null> {
+	return await db.oneOrNone<StartAfterColumnInfo>(
+		`
+		SELECT
+			format_type(COALESCE(NULLIF(t.typbasetype, 0), a.atttypid), NULL) AS data_type,
+			t.typcategory = 'S' AS is_text,
+			a.attnotnull AS not_null,
+			EXISTS (
+				SELECT 1
+				FROM pg_index i
+				WHERE i.indrelid = c.oid
+					AND i.indkey[0] = a.attnum
+					AND (i.indisprimary OR i.indisunique)
+					AND i.indisvalid
+					AND i.indpred IS NULL
+					AND COALESCE((to_jsonb(i) ->> 'indnkeyatts')::int, i.indnatts) = 1
+			) AS is_unique,
+			c.relkind <> 'p' AND EXISTS (SELECT 1 FROM pg_inherits WHERE inhparent = c.oid) AS has_child_tables
+		FROM pg_attribute a
+		JOIN pg_class c ON c.oid = a.attrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_type t ON t.oid = a.atttypid
+		WHERE n.nspname = $1 AND c.relname = $2 AND a.attname = $3 AND a.attnum > 0 AND NOT a.attisdropped;
+		`,
+		[schema, table, column],
+	);
+}
+
+/**
+ * `= ''` uses the unique index. octet_length leaves out values that are only equal to '',
+ * for example a blank char(n) value, which n8n gets back as spaces.
+ */
+async function hasEmptyText(
+	db: PgpDatabase,
+	schema: string,
+	table: string,
+	column: string,
+): Promise<boolean> {
+	const { has_empty_text } = await db.one<{ has_empty_text: boolean }>(
+		"SELECT EXISTS (SELECT 1 FROM $1:name.$2:name WHERE $3:name = '' AND octet_length($3:name) = 0) AS has_empty_text",
+		[schema, table, column],
+	);
+	return has_empty_text;
+}
+
+const TIMESTAMP_TYPES = ['timestamp without time zone', 'timestamp with time zone'];
+// n8n outputs values of these types, and of arrays, as objects, so they cannot be a Start After value
+const OBJECT_TYPES = ['bytea', 'interval', 'json', 'jsonb'];
+
+async function getStartAfterColumnProblem(
+	db: PgpDatabase,
+	schema: string,
+	table: string,
+	column: string,
+	largeNumbersOutput: PostgresNodeOptions['largeNumbersOutput'],
+	lookForEmptyText: boolean,
+): Promise<{ message: string; description: string } | undefined> {
+	const columnInfo = await getStartAfterColumnInfo(db, schema, table, column);
+
+	if (!columnInfo) {
+		return {
+			message: `Cannot find column "${column}" in "${schema}.${table}"`,
+			description: 'Check that the table exists and has this column.',
+		};
+	}
+	if (columnInfo.has_child_tables) {
+		return {
+			message: `Start After does not support "${schema}.${table}" because other tables inherit from it`,
+			description: `The node also gets the rows of the child tables. The unique index of "${table}" does not cover these rows, so a value of "${column}" can repeat and a page can skip rows. Use a table that has no child tables.`,
+		};
+	}
+	if (TIMESTAMP_TYPES.includes(columnInfo.data_type)) {
+		return {
+			message: `Start After does not support the timestamp column "${column}"`,
+			description: `"${column}" has the type ${columnInfo.data_type}. n8n can change the time zone and the precision of these values in the output, so the next page can repeat or skip rows. Use another unique column, for example the primary key.`,
+		};
+	}
+	if (OBJECT_TYPES.includes(columnInfo.data_type) || columnInfo.data_type.endsWith('[]')) {
+		return {
+			message: `Start After does not support the column "${column}" of type ${columnInfo.data_type}`,
+			description:
+				'n8n outputs these values as objects, so they cannot be the Start After value. Use a unique column with text or numbers.',
+		};
+	}
+	if (columnInfo.data_type === 'numeric' && largeNumbersOutput === 'numbers') {
+		return {
+			message: `Set Output Large-Format Numbers As to Text to page by "${column}"`,
+			description: `"${column}" is a NUMERIC column. With Numbers, n8n can round its values in the output, so the next page can repeat or skip rows.`,
+		};
+	}
+	if (!columnInfo.is_unique) {
+		return {
+			message: `Column "${column}" has no unique index that Start After can use`,
+			description:
+				'Start After needs a primary key or a unique index on this column alone. These do not count: a unique index on more than one column, with a WHERE condition or on an expression. A view has no indexes. If values repeat, a page skips the rows that share the last value.',
+		};
+	}
+	if (!columnInfo.not_null) {
+		return {
+			message: `Column "${column}" can be null`,
+			description: `Start After needs a column that is never null. A null value never comes after another value, so no page returns the rows with null. Make "${column}" NOT NULL, or use another unique column, for example the primary key.`,
+		};
+	}
+	// After the unique index check, so the lookup can use the index
+	if (lookForEmptyText && columnInfo.is_text && (await hasEmptyText(db, schema, table, column))) {
+		return {
+			message: `Column "${column}" has empty text in one row`,
+			description:
+				'An empty Value gets the first page. If a page ends on this row, the next page is the first page again, and the loop can repeat forever. With Sort DESC, the last page always ends on this row. Use another unique column, for example the primary key.',
+		};
+	}
+
+	return undefined;
+}
+
+export async function checkStartAfterColumn(
+	db: PgpDatabase,
+	node: INode,
+	itemIndex: number,
+	schema: string,
+	table: string,
+	column: string,
+	largeNumbersOutput?: PostgresNodeOptions['largeNumbersOutput'],
+	lookForEmptyText = true,
+) {
+	const problem = await getStartAfterColumnProblem(
+		db,
+		schema,
+		table,
+		column,
+		largeNumbersOutput,
+		lookForEmptyText,
+	);
+	if (problem) {
+		throw new NodeOperationError(node, problem.message, {
+			itemIndex,
+			description: problem.description,
+		});
+	}
+}
+
+export async function getEnums(db: PgpDatabase): Promise<Map<string, string[]>> {
+	const enums = await db.any<EnumInfo>(
+		'SELECT pg_type.typname, pg_enum.enumlabel FROM pg_type JOIN pg_enum ON pg_enum.enumtypid = pg_type.oid;',
+	);
+
+	return enums.reduce((map, { typname, enumlabel }) => {
+		const existingValues = map.get(typname) ?? [];
+		map.set(typname, [...existingValues, enumlabel]);
+		return map;
+	}, new Map<string, string[]>());
+}
+
+export function getEnumValues(
+	enumInfo: Map<string, string[]>,
+	enumName: string,
+): INodePropertyOptions[] {
+	const values = enumInfo.get(enumName) ?? [];
+	return values.map((value) => ({ name: value, value }));
+}
+
+export async function doesRowExist(
+	db: PgpDatabase,
+	schema: string,
+	table: string,
+	values: string[],
+): Promise<boolean> {
+	const where = [];
+	for (let i = 3; i < 3 + values.length; i += 2) {
+		where.push(`$${i}:name=$${i + 1}`);
+	}
+	const exists = await db.any(
+		`SELECT EXISTS(SELECT 1 FROM $1:name.$2:name WHERE ${where.join(' AND ')})`,
+		[schema, table, ...values],
+	);
+	return exists[0].exists;
+}
+
+export function checkItemAgainstSchema(
+	node: INode,
+	item: IDataObject,
+	columnsInfo: ColumnInfo[],
+	index: number,
+) {
+	if (columnsInfo.length === 0) return item;
+	const schema = columnsInfo.reduce((acc, { column_name, data_type, is_nullable }) => {
+		acc[column_name] = { type: data_type.toUpperCase(), nullable: is_nullable === 'YES' };
+		return acc;
+	}, {} as IDataObject);
+
+	for (const key of Object.keys(item)) {
+		if (schema[key] === undefined) {
+			throw new NodeOperationError(node, `Column '${key}' does not exist in selected table`, {
+				itemIndex: index,
+			});
+		}
+		if (item[key] === null && !(schema[key] as IDataObject)?.nullable) {
+			throw new NodeOperationError(node, `Column '${key}' is not nullable`, {
+				itemIndex: index,
+			});
+		}
+	}
+
+	return item;
+}
+
+export const configureTableSchemaUpdater = (initialSchema: string, initialTable: string) => {
+	let currentSchema = initialSchema;
+	let currentTable = initialTable;
+	return async (db: PgpDatabase, tableSchema: ColumnInfo[], schema: string, table: string) => {
+		if (currentSchema !== schema || currentTable !== table) {
+			currentSchema = schema;
+			currentTable = table;
+			tableSchema = await getTableSchema(db, schema, table);
+		}
+		return tableSchema;
+	};
+};
+
+/**
+ * If postgress column type is array we need to convert it to fornmat that postgres understands, original object data would be modified
+ * @param data the object with keys representing column names and values
+ * @param schema table schema
+ * @param node INode
+ * @param itemIndex the index of the current item
+ * @returns a new data object with the arrays converted to postgres format
+ */
+export const convertArraysToPostgresFormat = (
+	data: IDataObject,
+	schema: ColumnInfo[],
+	node: INode,
+	itemIndex = 0,
+) => {
+	const newData = deepCopy(data);
+	for (const columnInfo of schema) {
+		// in case column type is array we need to convert it to fornmat that postgres understands
+		if (columnInfo.data_type.toUpperCase() === 'ARRAY') {
+			let columnValue = newData[columnInfo.column_name];
+
+			if (typeof columnValue === 'string') {
+				columnValue = jsonParse(columnValue);
+			}
+
+			if (Array.isArray(columnValue)) {
+				const arrayEntries = columnValue.map((entry) => {
+					if (typeof entry === 'number') {
+						return entry;
+					}
+
+					if (typeof entry === 'boolean') {
+						entry = String(entry);
+					}
+
+					if (typeof entry === 'object') {
+						entry = JSON.stringify(entry);
+					}
+
+					if (typeof entry === 'string') {
+						return `"${entry.replace(/"/g, '\\"')}"`; //escape double quotes
+					}
+
+					return entry;
+				});
+
+				// wrap in {} instead of [] as postgres does and join with ,
+				newData[columnInfo.column_name] = `{${arrayEntries.join(',')}}`;
+			} else {
+				if (columnInfo.is_nullable === 'NO') {
+					throw new NodeOperationError(
+						node,
+						`Column '${columnInfo.column_name}' has to be an array`,
+						{
+							itemIndex,
+						},
+					);
+				}
+			}
+		}
+	}
+
+	return newData;
+};
+
+// operations use 'equal' instead of '=' because of the way expressions are handled
+// manually add '=' to allow entering it instead of 'equal'
+const conditionSet = new Set(operatorOptions.map((option) => option.value)).add('=');
+
+export const isWhereClause = (clause: unknown): clause is WhereClause => {
+	if (typeof clause !== 'object' || clause === null) return false;
+	if (!('column' in clause)) return false;
+	if (
+		!('condition' in clause) ||
+		typeof clause.condition !== 'string' ||
+		!conditionSet.has(clause.condition)
+	)
+		return false;
+	return true;
+};
+
+export const getWhereClauses = (ctx: IExecuteFunctions, itemIndex: number): WhereClause[] => {
+	const whereClauses = ctx.getNodeParameter('where', itemIndex, []) as IDataObject;
+	const whereClausesValues = whereClauses.values as unknown[];
+	if (!Array.isArray(whereClausesValues)) {
+		return [];
+	}
+	const someInvalid = whereClausesValues.some((clause) => !isWhereClause(clause));
+	if (someInvalid) {
+		throw new NodeOperationError(ctx.getNode(), 'Invalid where clause', {
+			itemIndex,
+		});
+	}
+	return whereClausesValues as WhereClause[];
+};
+
+export const runQueriesAndHandleErrors = async (
+	runQueries: QueriesRunner,
+	queries: QueryWithValues[],
+	nodeOptions: PostgresNodeOptions,
+	errorItemsMap: Map<number, INodeExecutionData>,
+) => {
+	// if we have any errors and we are not running the queries independently
+	// (i.e. `transaction` or `single` mode), we don't want to execute any
+	// queries that didn't error, since the operation should be atomic
+	if (errorItemsMap.size > 0 && nodeOptions.queryBatching !== 'independently') {
+		return Array.from(errorItemsMap.values());
+	}
+
+	const returnData = await runQueries(queries, nodeOptions);
+
+	const total = returnData.length + errorItemsMap.size;
+	const result = new Array<INodeExecutionData>(total);
+	let returnDataIndex = 0;
+	for (let i = 0; i < total; i++) {
+		const errorItem = errorItemsMap.get(i);
+		if (errorItem) {
+			result[i] = errorItem;
+		} else if (returnDataIndex < returnData.length) {
+			result[i] = returnData[returnDataIndex++];
+		}
+	}
+
+	return result;
+};

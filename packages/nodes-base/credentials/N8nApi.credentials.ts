@@ -1,0 +1,62 @@
+import type {
+	IAuthenticateGeneric,
+	ICredentialTestRequest,
+	ICredentialType,
+	INodeProperties,
+} from 'n8n-workflow';
+
+export class N8nApi implements ICredentialType {
+	name = 'n8nApi';
+
+	displayName = 'n8n API';
+
+	documentationUrl = 'https://docs.n8n.io/api/authentication/';
+
+	properties: INodeProperties[] = [
+		{
+			displayName: 'API Key',
+			name: 'apiKey',
+			type: 'string',
+			typeOptions: { password: true },
+			default: '',
+			description: 'The API key for the n8n instance',
+		},
+		{
+			displayName: 'Base URL',
+			name: 'baseUrl',
+			type: 'string',
+			default: '',
+			placeholder: 'https://<name>.app.n8n.cloud/api/v1',
+			description: 'The API URL of the n8n instance',
+		},
+	];
+
+	authenticate: IAuthenticateGeneric = {
+		type: 'generic',
+		properties: {
+			headers: {
+				'X-N8N-API-KEY': '={{ $credentials.apiKey }}',
+			},
+		},
+	};
+
+	test: ICredentialTestRequest = {
+		request: {
+			baseURL:
+				'={{ $credentials.baseUrl.replace(new RegExp("([^:])/{2,}", "g"), "$1/").replace(new RegExp("/+$"), "") }}',
+			url: '/credentials/schema/n8nApi',
+		},
+		rules: [
+			// A Base URL without `/api/v1` reaches the editor UI, which answers with HTML and a 200
+			{
+				type: 'responseSuccessBody',
+				properties: {
+					key: 'type',
+					value: undefined,
+					message:
+						'The Base URL does not point to the n8n API. Make sure it includes the API path, for example /api/v1.',
+				},
+			},
+		],
+	};
+}
