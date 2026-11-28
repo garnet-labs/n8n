@@ -1,0 +1,174 @@
+import type {
+	IDataObject,
+	IExecuteFunctions,
+	IHookFunctions,
+	IHttpRequestMethods,
+	ILoadOptionsFunctions,
+	IRequestOptions,
+	IWebhookFunctions,
+	JsonObject,
+	RequestPath,
+	WithRequestTarget,
+} from 'n8n-workflow';
+import { NodeApiError, NodeOperationError, requestPath, requestUrl } from 'n8n-workflow';
+
+export async function quickbaseApiRequest(
+	this: IExecuteFunctions | ILoadOptionsFunctions | IHookFunctions | IWebhookFunctions,
+	method: IHttpRequestMethods,
+	resource: RequestPath,
+
+	body: any = {},
+	qs: IDataObject = {},
+	option: Pick<IRequestOptions, 'json' | 'resolveWithFullResponse'> = {},
+): Promise<any> {
+	const credentials = await this.getCredentials('quickbaseApi');
+
+	if (!credentials.hostname) {
+		throw new NodeOperationError(this.getNode(), 'Hostname must be defined');
+	}
+
+	if (!credentials.userToken) {
+		throw new NodeOperationError(this.getNode(), 'User Token must be defined');
+	}
+
+	try {
+		const options: WithRequestTarget<IRequestOptions, 'uri'> = {
+			headers: {
+				'QB-Realm-Hostname': credentials.hostname,
+				'User-Agent': 'n8n',
+				Authorization: `QB-USER-TOKEN ${credentials.userToken}`,
+				'Content-Type': 'application/json',
+			},
+			method,
+			body,
+			qs,
+			uri: requestUrl`https://api.quickbase.com/v1${resource}`,
+			json: true,
+		};
+
+		if (Object.keys(body as IDataObject).length === 0) {
+			delete options.body;
+		}
+
+		if (Object.keys(qs).length === 0) {
+			delete options.qs;
+		}
+
+		if (Object.keys(option).length !== 0) {
+			Object.assign(options, option);
+		}
+
+		return await this.helpers?.request(options);
+	} catch (error) {
+		throw new NodeApiError(this.getNode(), error as JsonObject);
+	}
+}
+
+export async function getFieldsObject(
+	this: IHookFunctions | ILoadOptionsFunctions | IExecuteFunctions,
+	tableId: string,
+): Promise<any> {
+	const fieldsLabelKey: { [key: string]: number } = {};
+	const fieldsIdKey: { [key: number]: string } = {};
+	const data = await quickbaseApiRequest.call(this, 'GET', requestPath`/fields`, {}, { tableId });
+	for (const field of data) {
+		fieldsLabelKey[field.label] = field.id;
+		fieldsIdKey[field.id] = field.label;
+	}
+	return { fieldsLabelKey, fieldsIdKey };
+}
+
+export async function quickbaseApiRequestAllItems(
+	this: IHookFunctions | ILoadOptionsFunctions | IExecuteFunctions,
+	method: IHttpRequestMethods,
+	resource: RequestPath,
+
+	body: any = {},
+	query: IDataObject = {},
+): Promise<any> {
+	const returnData: IDataObject[] = [];
+
+	let responseData = [];
+
+	if (method === 'POST') {
+		body.options = {
+			skip: 0,
+			top: 100,
+		};
+	} else {
+		query.skip = 0;
+		query.top = 100;
+	}
+
+	let metadata;
+
+	do {
+		const {
+			data,
+			fields,
+			metadata: meta,
+		} = await quickbaseApiRequest.call(this, method, resource, body, query);
+
+		metadata = meta;
+
+		const fieldsIdKey: { [key: string]: string } = {};
+
+		for (const field of fields) {
+			fieldsIdKey[field.id] = field.label;
+		}
+
+		for (const record of data) {
+			const recordData: IDataObject = {};
+			for (const [key, value] of Object.entries(record as IDataObject)) {
+				recordData[fieldsIdKey[key]] = (value as IDataObject).value;
+			}
+			responseData.push(recordData);
+		}
+
+		if (method === 'POST') {
+			body.options.skip += body.options.top;
+		} else {
+			//@ts-ignore
+			query.skip += query.top;
+		}
+		returnData.push.apply(returnData, responseData);
+		responseData = [];
+	} while (returnData.length < metadata.totalRecords);
+
+	return returnData;
+}
+
+/**
+ * Replaces `$1`, `$2`, … in a Quick Base query with the matching parameter.
+ * The query language documents no way to escape a quote or a brace inside a
+ * value, so a parameter that contains one is rejected.
+ */
+export function applyWhereParameters(
+	this: IExecuteFunctions,
+	where: string,
+	parameters: IDataObject[],
+	itemIndex: number,
+) {
+	if (!where || parameters.length === 0) return where;
+
+	return where.replace(/\$(\d+)/g, (_match, index: string) => {
+		const position = Number(index) - 1;
+		if (position < 0 || position >= parameters.length) {
+			throw new NodeOperationError(
+				this.getNode(),
+				`'Where' references parameter $${index}, but only ${parameters.length} parameter(s) were provided`,
+				{ itemIndex },
+			);
+		}
+
+		const value = String(parameters[position].value);
+		const found = ["'", '"', '{', '}'].find((delimiter) => value.includes(delimiter));
+		if (found !== undefined) {
+			throw new NodeOperationError(this.getNode(), `'Where Parameters' cannot contain ${found}`, {
+				itemIndex,
+				description: `Quick Base has no way to quote ${found} inside a value. Remove it from 'Where Parameters'.`,
+			});
+		}
+		return value;
+	});
+}
