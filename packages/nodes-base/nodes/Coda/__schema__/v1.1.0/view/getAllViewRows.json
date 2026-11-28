@@ -1,0 +1,33 @@
+{
+    "type": "object",
+    "properties": {
+        "contractTextOutput": {
+            "type": "string"
+        },
+        "extractText": {
+            "type": "string"
+        },
+        "fileSize": {
+            "type": "string"
+        },
+        "id": {
+            "type": "string"
+        },
+        "lastUpdated": {
+            "type": "string"
+        },
+        "over4MB?": {
+            "type": "boolean"
+        },
+        "rowID": {
+            "type": "integer"
+        },
+        "Summarize": {
+            "type": "string"
+        },
+        "Summary": {
+            "type": "string"
+        }
+    },
+    "version": 2
+}
