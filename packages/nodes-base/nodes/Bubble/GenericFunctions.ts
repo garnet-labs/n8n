@@ -1,0 +1,98 @@
+import type {
+	IExecuteFunctions,
+	IHookFunctions,
+	IDataObject,
+	ILoadOptionsFunctions,
+	JsonObject,
+	IHttpRequestMethods,
+	IRequestOptions,
+	RequestPath,
+	WithRequestTarget,
+} from 'n8n-workflow';
+import { NodeApiError, requestPath, requestUrl } from 'n8n-workflow';
+
+/**
+ * Make an authenticated API request to Bubble.
+ */
+export async function bubbleApiRequest(
+	this: IHookFunctions | IExecuteFunctions | ILoadOptionsFunctions,
+	method: IHttpRequestMethods,
+	endpoint: RequestPath,
+	body: IDataObject,
+	qs: IDataObject,
+) {
+	const { apiToken, appName, domain, environment, hosting } = await this.getCredentials<{
+		apiToken: string;
+		appName: string;
+		domain: string;
+		environment: 'development' | 'live';
+		hosting: 'bubbleHosted' | 'selfHosted';
+	}>('bubbleApi');
+
+	const path =
+		environment === 'development'
+			? requestPath`/version-test/api/1.1${endpoint}`
+			: requestPath`/api/1.1${endpoint}`;
+
+	const options: WithRequestTarget<IRequestOptions, 'uri'> = {
+		headers: {
+			Authorization: `Bearer ${apiToken}`,
+		},
+		method,
+		uri:
+			hosting === 'bubbleHosted'
+				? requestUrl`https://${appName}.bubbleapps.io${path}`
+				: requestUrl`${domain}${path}`,
+		qs,
+		body,
+		json: true,
+	};
+
+	if (!Object.keys(body).length) {
+		delete options.body;
+	}
+
+	if (!Object.keys(qs).length) {
+		delete options.qs;
+	}
+
+	try {
+		return await this.helpers.request(options);
+	} catch (error) {
+		throw new NodeApiError(this.getNode(), error as JsonObject);
+	}
+}
+
+/**
+ * Make an authenticated API request to Bubble and return all results.
+ */
+export async function bubbleApiRequestAllItems(
+	this: IHookFunctions | IExecuteFunctions | ILoadOptionsFunctions,
+	method: IHttpRequestMethods,
+	endpoint: RequestPath,
+	body: IDataObject,
+	qs: IDataObject,
+) {
+	const returnData: IDataObject[] = [];
+
+	let responseData;
+	qs.limit = 100;
+	qs.cursor = 0;
+	do {
+		responseData = await bubbleApiRequest.call(this, method, endpoint, body, qs);
+		qs.cursor += qs.limit;
+		returnData.push.apply(returnData, responseData.response.results as IDataObject[]);
+	} while (responseData.response.remaining !== 0);
+
+	return returnData;
+}
+
+export function validateJSON(json: string | undefined): any {
+	let result;
+	try {
+		result = JSON.parse(json!);
+	} catch (exception) {
+		result = undefined;
+	}
+	return result;
+}

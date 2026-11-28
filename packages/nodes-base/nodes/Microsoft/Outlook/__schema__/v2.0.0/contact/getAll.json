@@ -1,0 +1,32 @@
+{
+    "type": "object",
+    "properties": {
+        "businessPhones": {
+            "type": "array",
+            "items": {
+                "type": "string"
+            }
+        },
+        "displayName": {
+            "type": "string"
+        },
+        "emailAddresses": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "address": {
+                        "type": "string"
+                    },
+                    "name": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "id": {
+            "type": "string"
+        }
+    },
+    "version": 6
+}
